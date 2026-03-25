@@ -21,7 +21,7 @@ from ..io import (
     find_csv_for_scene, find_cameras_in_folder, load_csv_as_pts3d,
     annotations_path, load_annotations, save_annotations,
 )
-from ..vision import project_pts, draw_skel, clear_projection_cache
+from ..vision import project_pts, draw_skel, draw_skel_with_confidence, clear_projection_cache
 
 
 class ClipAnnotator(QMainWindow):
@@ -51,6 +51,7 @@ class ClipAnnotator(QMainWindow):
         self.vtotal = 0
         self.pts3d = None
         self.pts3d_valid = None
+        self.pts3d_was_nan = None   # (T, J) bool: True = originally NaN, now interpolated
         self.pfps = DEFAULT_POINTS_FPS
         self.calibs: dict = {}
         self.scene_offset = 0
@@ -265,6 +266,7 @@ class ClipAnnotator(QMainWindow):
         self.video_folder = None
         self.pts3d = None
         self.pts3d_valid = None
+        self.pts3d_was_nan = None
         self.avail_cams = []
 
         if self.data_root:
@@ -281,7 +283,7 @@ class ClipAnnotator(QMainWindow):
         if csv_path:
             result = load_csv_as_pts3d(csv_path)
             if result[0] is not None:
-                self.pts3d, self.pts3d_valid = result
+                self.pts3d, self.pts3d_valid, self.pts3d_was_nan = result
 
         self.cam_combo.blockSignals(True)
         self.cam_combo.clear()
@@ -644,7 +646,11 @@ class ClipAnnotator(QMainWindow):
                 proj = project_pts(pts, intr, extr,
                                    self.flip[0], self.flip[1], self.flip[2])
                 if proj is not None:
-                    draw_skel(frame, proj)
+                    # Get per-joint interpolation mask for this frame
+                    nan_mask = None
+                    if self.pts3d_was_nan is not None:
+                        nan_mask = self.pts3d_was_nan[pidx]  # (J,) bool
+                    draw_skel_with_confidence(frame, proj, nan_mask)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bpl = ch * w

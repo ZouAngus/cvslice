@@ -81,19 +81,26 @@ def find_cameras_in_folder(folder: str) -> list[str]:
     return cams
 
 
-def load_csv_as_pts3d(csv_path: str) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """Load extracted CSV -> (T, J, 3) array.
+def load_csv_as_pts3d(csv_path: str) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Load extracted CSV -> (T, J, 3) array with NaN interpolation.
 
-    NaN values are filled with 0.
-    Returns (pts3d_array, valid_mask) where valid_mask[i] is True if frame i
-    has at least one non-zero joint.
+    Returns (pts3d_array, valid_mask, was_nan_mask):
+        - pts3d_array: (T, J, 3) with NaN replaced by interpolated values
+        - valid_mask: (T,) bool — True if frame has at least one originally valid joint
+        - was_nan_mask: (T, J) bool — True where original data was NaN (now interpolated)
     """
+    from ..vision.interpolation import interpolate_joints
+
     df = pd.read_csv(csv_path)
     df = df.apply(pd.to_numeric, errors="coerce")
-    df = df.fillna(0.0)
     nc = df.shape[1]
     if nc % 3 != 0:
-        return None, None
-    pts = df.values.reshape(-1, nc // 3, 3)
-    valid = np.any(pts != 0, axis=(1, 2))
-    return pts, valid
+        return None, None, None
+    pts_raw = df.values.reshape(-1, nc // 3, 3)
+
+    # Interpolate NaN gaps
+    pts_filled, was_nan = interpolate_joints(pts_raw)
+
+    # Valid mask: frame has at least one originally non-NaN joint
+    valid = ~np.all(was_nan, axis=1)
+    return pts_filled, valid, was_nan
