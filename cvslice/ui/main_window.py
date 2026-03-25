@@ -841,11 +841,23 @@ class ClipAnnotator(QMainWindow):
     # =======================================================================
 
     def _make_action_tag(self, action_dict: dict) -> str:
-        """Merge action + variant into a single tag: e.g. 'walk_clockwise'."""
+        """Merge action + variant into a single tag: e.g. 'walking_clockwise'.
+
+        Cleans up:
+        - '/' treated as no variant
+        - spaces → underscores, lowercase
+        - If an action has variants elsewhere but this row is empty,
+          we don't append anything (the rep counter handles uniqueness).
+        """
         act = action_dict["action"].strip().lower().replace(" ", "_").replace("/", "_")
-        var = (action_dict.get("variant") or "").strip().lower().replace(" ", "_").replace("/", "_")
+        var = (action_dict.get("variant") or "").strip()
+        # Treat "/" or empty as no variant
+        if var in ("", "/"):
+            var = ""
+        else:
+            var = var.lower().replace(" ", "_").replace("/", "_").replace("-", "_")
         if var:
-            act = f"{act}_{var}"
+            return f"{act}_{var}"
         return act
 
     def _assign_reps(self, indices: list[int]) -> dict[int, int]:
