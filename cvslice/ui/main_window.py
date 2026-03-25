@@ -868,33 +868,62 @@ class ClipAnnotator(QMainWindow):
         act_tag = self._make_action_tag(action_dict)
         return f"{cam_s}-{act_tag}-rep{rep}"
 
-    def _build_export_dir_name(self, seq: int, scene: str) -> str:
-        """Build directory name: 01-boss."""
+    def _build_export_dir_name(self, actor_id: int, scene: str) -> str:
+        """Build directory name: 15-boss (actor_id fixed for all actions)."""
         scene_s = scene.lower().replace(" ", "_").replace("/", "_") if scene else "unknown"
-        return f"{seq:02d}-{scene_s}"
+        return f"{actor_id:02d}-{scene_s}"
+
+    def _guess_actor_id(self) -> int:
+        """Try to auto-detect actor/session number from data paths.
+
+        Checks (in order):
+          1. Excel filename: DataCollection_15.xlsx → 15
+          2. CSV filename: extracted_boss_01.csv → 01
+          3. Data folder name containing digits
+        Falls back to 1.
+        """
+        import re
+        # From Excel path
+        xlsx = getattr(self, "xlsx_path", None)
+        if xlsx:
+            base = os.path.splitext(os.path.basename(xlsx))[0]
+            m = re.search(r'(\d+)', base)
+            if m:
+                return int(m.group(1))
+        # From CSV path
+        csv_path = getattr(self, "_csv_path", None)
+        if csv_path:
+            base = os.path.splitext(os.path.basename(csv_path))[0]
+            m = re.search(r'(\d+)', base)
+            if m:
+                return int(m.group(1))
+        # From data folder
+        vf = getattr(self, "video_folder", None)
+        if vf:
+            m = re.search(r'(\d+)', os.path.basename(vf))
+            if m:
+                return int(m.group(1))
+        return 1
 
     def _preview_export_tree(self, indices: list[int],
                              export_cams: list[str],
-                             start_seq: int) -> list[str]:
+                             actor_id: int) -> list[str]:
         """Generate preview lines showing the full export tree."""
         reps = self._assign_reps(indices)
         lines = []
-        seq = start_seq
+        dir_name = self._build_export_dir_name(actor_id, self.cur_scene)
+        lines.append(f"{dir_name}/")
         for ai in indices:
             a = self.actions[ai]
             rep = reps[ai]
-            dir_name = self._build_export_dir_name(seq, self.cur_scene)
             act_tag = self._make_action_tag(a)
-            lines.append(f"{dir_name}/")
             for cn in export_cams:
                 stem = self._build_export_stem(cn, a, rep)
                 lines.append(f"  {stem}.mp4")
             if self.pts3d is not None:
-                lines.append(f"  {act_tag}-rep{rep}.csv  (3D points)")
-            lines.append(f"  offsets.json")
-            lines.append(f"  calibration/  (camera params)")
-            lines.append("")
-            seq += 1
+                lines.append(f"  {act_tag}-rep{rep}.csv")
+        lines.append(f"  offsets.json")
+        lines.append(f"  calibration/")
         return lines
 
     def _export(self, all_actions, single_cam=False):
@@ -918,19 +947,23 @@ class ClipAnnotator(QMainWindow):
             export_cams = self.avail_cams if self.avail_cams else ["virtual"]
 
         # --- Preview dialog ---
-        preview_lines = self._preview_export_tree(indices, export_cams, 1)
+        guessed_id = self._guess_actor_id()
+        preview_lines = self._preview_export_tree(indices, export_cams, guessed_id)
 
         from PyQt5.QtWidgets import QDialog, QDialogButtonBox, QTextEdit
         dlg = QDialog(self)
         dlg.setWindowTitle("Export Preview")
         dlg.setMinimumSize(620, 450)
         lay = QVBoxLayout(dlg)
-        lay.addWidget(QLabel("Export preview — confirm directory structure:"))
+        lay.addWidget(QLabel("Export preview — all actions share the same actor ID:"))
         seq_row = QHBoxLayout()
-        seq_row.addWidget(QLabel("Starting sequence number:"))
+        seq_row.addWidget(QLabel("Actor / session ID:"))
         seq_spin = QSpinBox()
         seq_spin.setRange(0, 999)
-        seq_spin.setValue(1)
+        seq_spin.setValue(guessed_id)
+        seq_spin.setToolTip(
+            f"Auto-detected: {guessed_id}\n"
+            "Change this to set the actor/session number for all exported files.")
         seq_row.addWidget(seq_spin)
         seq_row.addStretch()
         lay.addLayout(seq_row)
@@ -953,14 +986,56 @@ class ClipAnnotator(QMainWindow):
         if dlg.exec_() != QDialog.Accepted:
             return
 
-        start_seq = seq_spin.value()
+        actor_id = seq_spin.value()
         reps = self._assign_reps(indices)
+
+        # Single shared directory for all actions
+        dir_name = self._build_export_dir_name(actor_id, self.cur_scene)
+        act_dir = os.path.join(out_dir, dir_name)
+        os.makedirs(act_dir, exist_ok=True)
+
+        # --- Save offsets.json (all actions in one file) ---
+        import json as _json
+        all_offsets = []
+        for ai in indices:
+            a = self.actions[ai]
+            rep = reps[ai]
+            ov = self.overrides.get(ai, {})
+            sf = ov.get("start", a["start"])
+            ef = ov.get("end", a["end"])
+            total_off = self.scene_offset + self._get_effective_act_offset(ai)
+            all_offsets.append({
+                "action": self._make_action_tag(a),
+                "rep": rep,
+                "start_frame": sf,
+                "end_frame": ef,
+                "scene_offset": self.scene_offset,
+                "effective_offset": total_off,
+            })
+        offset_doc = {
+            "actor_id": actor_id,
+            "scene": self.cur_scene,
+            "actions": all_offsets,
+        }
+        with open(os.path.join(act_dir, "offsets.json"), "w") as f:
+            _json.dump(offset_doc, f, indent=2, ensure_ascii=False)
+
+        # --- Copy calibration files ---
+        if self.calibs:
+            cal_dst = os.path.join(act_dir, "calibration")
+            os.makedirs(cal_dst, exist_ok=True)
+            cal_folder = getattr(self, "cal_folder", None)
+            if cal_folder and os.path.isdir(cal_folder):
+                import shutil
+                for fn in os.listdir(cal_folder):
+                    if fn.lower().endswith(".json"):
+                        src = os.path.join(cal_folder, fn)
+                        shutil.copy2(src, os.path.join(cal_dst, fn))
 
         total_ops = len(indices) * len(export_cams)
         prog = QProgressDialog("Exporting...", "Cancel", 0, total_ops, self)
         prog.setWindowModality(Qt.WindowModal); prog.setMinimumDuration(0)
         op = 0
-        seq = start_seq
 
         for ai in indices:
             a = self.actions[ai]
@@ -970,39 +1045,6 @@ class ClipAnnotator(QMainWindow):
             ef = ov.get("end", a["end"])
             total_off = self.scene_offset + self._get_effective_act_offset(ai)
             act_tag = self._make_action_tag(a)
-
-            # Create action directory: 01-boss/
-            dir_name = self._build_export_dir_name(seq, self.cur_scene)
-            act_dir = os.path.join(out_dir, dir_name)
-            os.makedirs(act_dir, exist_ok=True)
-
-            # --- Save offsets.json ---
-            import json as _json
-            offset_info = {
-                "scene": self.cur_scene,
-                "scene_offset": self.scene_offset,
-                "action": a["action"],
-                "variant": a.get("variant", ""),
-                "rep": rep,
-                "start_frame": sf,
-                "end_frame": ef,
-                "effective_offset": total_off,
-            }
-            with open(os.path.join(act_dir, "offsets.json"), "w") as f:
-                _json.dump(offset_info, f, indent=2, ensure_ascii=False)
-
-            # --- Copy calibration files ---
-            if self.calibs:
-                cal_dst = os.path.join(act_dir, "calibration")
-                os.makedirs(cal_dst, exist_ok=True)
-                # Find and copy original calibration files
-                cal_folder = getattr(self, "cal_folder", None)
-                if cal_folder and os.path.isdir(cal_folder):
-                    import shutil
-                    for fn in os.listdir(cal_folder):
-                        if fn.lower().endswith(".json"):
-                            src = os.path.join(cal_folder, fn)
-                            shutil.copy2(src, os.path.join(cal_dst, fn))
 
             # --- Export 3D points CSV ---
             if self.pts3d is not None:
@@ -1067,9 +1109,9 @@ class ClipAnnotator(QMainWindow):
                 writer.release(); cap2.release()
                 op += 1; prog.setValue(op)
                 QCoreApplication.processEvents()
-            seq += 1
         prog.close()
-        QMessageBox.information(self, "Done", f"Exported {len(indices)} actions to:\n{out_dir}")
+        QMessageBox.information(self, "Done",
+            f"Exported {len(indices)} actions to:\n{act_dir}")
 
     def _export_virtual_to(self, act_dir, stem, sf, ef, total_off):
         """Export a virtual (black background + skeleton) video clip."""
