@@ -21,7 +21,11 @@ from ..io import (
     find_csv_for_scene, find_cameras_in_folder, load_csv_as_pts3d,
     annotations_path, load_annotations, save_annotations,
 )
-from ..vision import project_pts, draw_skel, draw_skel_with_confidence, clear_projection_cache
+from ..vision import (
+    project_pts, draw_skel, draw_skel_with_confidence, clear_projection_cache,
+    unproject_2d_to_3d, get_camera_depth, extract_R_t, find_nearest_joint,
+)
+from .video_label import VideoLabel
 
 
 class ClipAnnotator(QMainWindow):
@@ -66,6 +70,13 @@ class ClipAnnotator(QMainWindow):
         self._cached_frame = None
         self.loop_playback = True
         self._annotations: dict = {}
+        self._pts3d_dirty = False   # True if user has manually edited 3D points
+
+        # Joint drag state
+        self._drag_joint = None     # index of joint being dragged
+        self._drag_proj = None      # current 2D projections (J, 2) for hit-testing
+        self._drag_pidx = None      # pts3d frame index of the dragged frame
+        self._undo_stack: list[tuple[int, int, np.ndarray]] = []  # (pidx, joint, old_xyz)
 
         self._build_ui()
         self.timer = QTimer()
@@ -86,6 +97,9 @@ class ClipAnnotator(QMainWindow):
         fm.addAction("Load Calibration Folder...", self._load_cal)
         fm.addSeparator()
         fm.addAction("Save Offsets", self._save_current_annotations)
+        fm.addAction("Save Edited 3D Points...", self._save_edited_csv)
+        edm = mb.addMenu("Edit")
+        edm.addAction("Undo Joint Move (Ctrl+Z)", self._undo_joint_edit)
         em = mb.addMenu("Export")
         em.addAction("Export Current Clip (all cams)...",
                      lambda: self._export(False, single_cam=False))
@@ -131,11 +145,15 @@ class ClipAnnotator(QMainWindow):
 
         # ---- CENTER panel ----
         center = QWidget(); cvl = QVBoxLayout(center); cvl.setContentsMargins(0, 0, 0, 0)
-        self.vid_lbl = QLabel()
+        self.vid_lbl = VideoLabel()
         self.vid_lbl.setAlignment(Qt.AlignCenter)
         self.vid_lbl.setMinimumSize(640, 400)
         self.vid_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.vid_lbl.setStyleSheet("background:black;")
+        self.vid_lbl.setMouseTracking(True)
+        self.vid_lbl.mouse_pressed.connect(self._on_mouse_press)
+        self.vid_lbl.mouse_moved.connect(self._on_mouse_move)
+        self.vid_lbl.mouse_released.connect(self._on_mouse_release)
         cvl.addWidget(self.vid_lbl)
         self.info_lbl = QLabel("Frame: - / -   Time: - / -")
         self.info_lbl.setStyleSheet("font-size:13px; padding:2px;")
@@ -188,6 +206,13 @@ class ClipAnnotator(QMainWindow):
         self.loop_cb.stateChanged.connect(
             lambda s: setattr(self, "loop_playback", s == Qt.Checked))
         ff.addRow(self.loop_cb)
+        self.edit_cb = QCheckBox("Edit Mode (drag joints)")
+        self.edit_cb.setChecked(False)
+        self.edit_cb.setToolTip(
+            "Enable to click and drag skeleton joints.\n"
+            "Edits modify the 3D points in memory.\n"
+            "Use Ctrl+Z to undo, File > Save Edited 3D Points to export.")
+        ff.addRow(self.edit_cb)
         for axis, idx in [("Flip X", 0), ("Flip Y", 1), ("Flip Z", 2)]:
             cb = QCheckBox(axis)
             cb.stateChanged.connect(lambda s, i=idx: self._set_flip(i, s == Qt.Checked))
@@ -636,6 +661,8 @@ class ClipAnnotator(QMainWindow):
         need_skel = (self.show_skel and self.pts3d is not None
                      and self.active_cam and self.active_cam in self.calibs)
         frame = raw.copy() if need_skel else raw
+        self._drag_proj = None  # reset projection cache
+        self._drag_pidx = None
         if need_skel:
             intr, extr = self.calibs[self.active_cam]
             total_off = self.scene_offset + self._get_effective_act_offset(self.cur_act)
@@ -646,11 +673,19 @@ class ClipAnnotator(QMainWindow):
                 proj = project_pts(pts, intr, extr,
                                    self.flip[0], self.flip[1], self.flip[2])
                 if proj is not None:
-                    # Get per-joint interpolation mask for this frame
                     nan_mask = None
                     if self.pts3d_was_nan is not None:
-                        nan_mask = self.pts3d_was_nan[pidx]  # (J,) bool
+                        nan_mask = self.pts3d_was_nan[pidx]
                     draw_skel_with_confidence(frame, proj, nan_mask)
+                    # Highlight dragged joint
+                    if self._drag_joint is not None and self._drag_joint < len(proj):
+                        jx, jy = int(proj[self._drag_joint][0]), int(proj[self._drag_joint][1])
+                        cv2.circle(frame, (jx, jy), 8, (0, 255, 0), 2)
+                    self._drag_proj = proj
+                    self._drag_pidx = pidx
+        # Update video label frame size for coordinate mapping
+        h_f, w_f = (frame.shape[0], frame.shape[1])
+        self.vid_lbl.set_frame_size(w_f, h_f)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bpl = ch * w
@@ -672,11 +707,121 @@ class ClipAnnotator(QMainWindow):
             f"({fmt_time(t_cs)}-{fmt_time(t_ce)})")
 
     # =======================================================================
+    #  Joint dragging (Edit Mode)
+    # =======================================================================
+    def _on_mouse_press(self, fx, fy):
+        """Mouse pressed on video at frame coords (fx, fy)."""
+        if not self.edit_cb.isChecked():
+            return
+        if self._drag_proj is None or self._drag_pidx is None:
+            return
+        if self.playing:
+            self._toggle_play()  # pause during editing
+        joint = find_nearest_joint(fx, fy, self._drag_proj)
+        if joint is not None:
+            self._drag_joint = joint
+            # Save old position for undo BEFORE any move
+            pidx = self._drag_pidx
+            self._undo_stack.append(
+                (pidx, joint, self.pts3d[pidx, joint].copy()))
+            self.statusBar().showMessage(f"Dragging joint {joint}...")
+            self._show_frame()  # highlight selected joint
+
+    def _on_mouse_move(self, fx, fy):
+        """Mouse moved during drag — live preview of joint position."""
+        if self._drag_joint is None or not self.edit_cb.isChecked():
+            return
+        if self._drag_pidx is None or self.pts3d is None:
+            return
+        if not self.active_cam or self.active_cam not in self.calibs:
+            return
+        intr, extr = self.calibs[self.active_cam]
+        Rt = extract_R_t(extr)
+        if Rt is None:
+            return
+        R, t = Rt
+        K = np.array(intr["camera_matrix"], dtype=np.float64)
+
+        pidx = self._drag_pidx
+        j = self._drag_joint
+        old_pt = self.pts3d[pidx, j].copy()
+
+        # Apply flip to get the point as it was projected
+        pt_flip = old_pt.copy()
+        if self.flip[0]: pt_flip[0] *= -1
+        if self.flip[1]: pt_flip[1] *= -1
+        if self.flip[2]: pt_flip[2] *= -1
+
+        z_cam = get_camera_depth(pt_flip, R, t)
+        if z_cam <= 0:
+            return  # point is behind camera
+
+        new_pt_flip = unproject_2d_to_3d(fx, fy, z_cam, K, R, t)
+
+        # Un-flip to get back to storage space
+        new_pt = new_pt_flip.copy()
+        if self.flip[0]: new_pt[0] *= -1
+        if self.flip[1]: new_pt[1] *= -1
+        if self.flip[2]: new_pt[2] *= -1
+
+        self.pts3d[pidx, j] = new_pt
+        self._show_frame()
+
+    def _on_mouse_release(self, fx, fy):
+        """Mouse released — finalize the drag and push to undo stack."""
+        if self._drag_joint is None:
+            return
+        if self._drag_pidx is not None and self.pts3d is not None:
+            # The final position is already set by _on_mouse_move
+            # Push to undo stack (the old position was saved at press time... 
+            # but we need to save it BEFORE the drag started)
+            self._pts3d_dirty = True
+            self.statusBar().showMessage(
+                f"Joint {self._drag_joint} moved at pts3d frame {self._drag_pidx}. "
+                f"Ctrl+Z to undo. {len(self._undo_stack)} edits in stack.")
+        self._drag_joint = None
+        self._show_frame()
+
+    def _undo_joint_edit(self):
+        """Undo the last joint edit."""
+        if not self._undo_stack:
+            self.statusBar().showMessage("Nothing to undo.")
+            return
+        pidx, joint, old_xyz = self._undo_stack.pop()
+        if self.pts3d is not None and pidx < self.pts3d.shape[0]:
+            self.pts3d[pidx, joint] = old_xyz
+            self._show_frame()
+            self.statusBar().showMessage(
+                f"Undone: joint {joint} at frame {pidx} restored. "
+                f"{len(self._undo_stack)} edits remaining.")
+
+    def _save_edited_csv(self):
+        """Save the (possibly edited) 3D points to a new CSV file."""
+        if self.pts3d is None:
+            QMessageBox.warning(self, "Warning", "No 3D point data loaded.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Edited 3D Points", "", "CSV Files (*.csv)")
+        if not path:
+            return
+        T, J, _ = self.pts3d.shape
+        cols = []
+        for j in range(J):
+            cols.extend([f"{j}_x", f"{j}_y", f"{j}_z"])
+        flat = self.pts3d.reshape(T, -1)
+        pd.DataFrame(flat, columns=cols).to_csv(path, index=False)
+        self._pts3d_dirty = False
+        QMessageBox.information(self, "Saved", f"3D points saved to:\n{path}")
+
+    # =======================================================================
     #  Keyboard
     # =======================================================================
     def keyPressEvent(self, event):
         k = event.key()
-        if k == Qt.Key_Space: self._toggle_play()
+        mods = event.modifiers()
+        if mods & Qt.ControlModifier and k == Qt.Key_Z:
+            self._undo_joint_edit()
+        elif k == Qt.Key_Space: self._toggle_play()
         elif k == Qt.Key_A: self._prev()
         elif k == Qt.Key_D: self._nxt()
         elif k == Qt.Key_Q: self._jump(-1)
@@ -815,6 +960,14 @@ class ClipAnnotator(QMainWindow):
         writer.release()
 
     def closeEvent(self, event):
+        if self._pts3d_dirty:
+            reply = QMessageBox.question(
+                self, "Unsaved Edits",
+                "You have unsaved 3D point edits. Close without saving?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
         if self._save_timer.isActive():
             self._save_timer.stop()
         self._save_scene_state()
