@@ -1,0 +1,10 @@
+# Build artifacts
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# Temp scripts
+build.bat
+check_deps.bat
