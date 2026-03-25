@@ -862,11 +862,20 @@ class ClipAnnotator(QMainWindow):
             counts[tag] = rep + 1
         return result
 
-    def _build_export_stem(self, cam: str, action_dict: dict, rep: int) -> str:
-        """Build filename stem: topcenter-walk_clockwise-rep1."""
+    def _build_export_stem(self, actor_id: int, scene: str,
+                           cam: str, action_dict: dict, rep: int) -> str:
+        """Build filename stem: 15-boss-topcenter-walk-rep1."""
+        scene_s = scene.lower().replace(" ", "_").replace("/", "_") if scene else "unknown"
         cam_s = cam.lower().replace(" ", "_")
         act_tag = self._make_action_tag(action_dict)
-        return f"{cam_s}-{act_tag}-rep{rep}"
+        return f"{actor_id:02d}-{scene_s}-{cam_s}-{act_tag}-rep{rep}"
+
+    def _build_csv_stem(self, actor_id: int, scene: str,
+                        action_dict: dict, rep: int) -> str:
+        """Build CSV filename stem: 15-boss-walk-rep1."""
+        scene_s = scene.lower().replace(" ", "_").replace("/", "_") if scene else "unknown"
+        act_tag = self._make_action_tag(action_dict)
+        return f"{actor_id:02d}-{scene_s}-{act_tag}-rep{rep}"
 
     def _build_export_dir_name(self, actor_id: int, scene: str) -> str:
         """Build directory name: 15-boss (actor_id fixed for all actions)."""
@@ -916,12 +925,12 @@ class ClipAnnotator(QMainWindow):
         for ai in indices:
             a = self.actions[ai]
             rep = reps[ai]
-            act_tag = self._make_action_tag(a)
             for cn in export_cams:
-                stem = self._build_export_stem(cn, a, rep)
+                stem = self._build_export_stem(actor_id, self.cur_scene, cn, a, rep)
                 lines.append(f"  {stem}.mp4")
             if self.pts3d is not None:
-                lines.append(f"  {act_tag}-rep{rep}.csv")
+                csv_stem = self._build_csv_stem(actor_id, self.cur_scene, a, rep)
+                lines.append(f"  {csv_stem}.csv")
         lines.append(f"  offsets.json")
         lines.append(f"  calibration/")
         return lines
@@ -1055,14 +1064,14 @@ class ClipAnnotator(QMainWindow):
                 cols = []
                 for j in range(nj):
                     cols.extend([f"{j}_x", f"{j}_y", f"{j}_z"])
-                csv_name = f"{act_tag}-rep{rep}.csv"
+                csv_name = self._build_csv_stem(actor_id, self.cur_scene, a, rep) + ".csv"
                 pd.DataFrame(sl.reshape(sl.shape[0], -1), columns=cols).to_csv(
                     os.path.join(act_dir, csv_name), index=False)
 
             # --- Export video per camera ---
             for cn in export_cams:
                 if prog.wasCanceled(): break
-                stem = self._build_export_stem(cn, a, rep)
+                stem = self._build_export_stem(actor_id, self.cur_scene, cn, a, rep)
 
                 if cn == "virtual":
                     self._export_virtual_to(act_dir, stem, sf, ef, total_off)
