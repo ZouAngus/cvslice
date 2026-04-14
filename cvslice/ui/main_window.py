@@ -248,18 +248,15 @@ class ClipAnnotator(QMainWindow):
         pg = QGroupBox("Propagate Edits")
         pfl = QVBoxLayout(pg)
 
-        # Joint selector
+        # Joint selector — click-to-select (shown as read-only label)
         jrow = QHBoxLayout()
         jrow.addWidget(QLabel("Joint:"))
-        self.joint_spin = QSpinBox()
-        self.joint_spin.setRange(0, 99)
-        self.joint_spin.setValue(0)
-        self.joint_spin.setToolTip("Joint index to propagate")
-        jrow.addWidget(self.joint_spin)
-        self.pick_joint_btn = QPushButton("Pick")
-        self.pick_joint_btn.setToolTip("Click a joint in the view to select it")
-        self.pick_joint_btn.setCheckable(True)
-        jrow.addWidget(self.pick_joint_btn)
+        self.joint_lbl = QLabel("(click to select)")
+        self.joint_lbl.setStyleSheet(
+            "font-weight:bold; padding:2px 6px; "
+            "background:#2a2a2a; border:1px solid #555; border-radius:3px;")
+        self.joint_lbl.setToolTip("Click a joint in the view to select it for propagation")
+        jrow.addWidget(self.joint_lbl)
         pfl.addLayout(jrow)
 
         # Anchor controls
@@ -329,6 +326,12 @@ class ClipAnnotator(QMainWindow):
 
         rv.addWidget(pg)
 
+        # ---- Help button ----
+        self.help_btn = QPushButton("❓ Editing Guide")
+        self.help_btn.setToolTip("Show how to use the 3D joint editing tools")
+        self.help_btn.clicked.connect(self._show_editing_help)
+        rv.addWidget(self.help_btn)
+
         rv.addStretch()
         hl.addWidget(right)
         self.statusBar().showMessage(
@@ -342,6 +345,46 @@ class ClipAnnotator(QMainWindow):
             self._pending_ray = None
             self.tri_status_lbl.setText("")
 
+    def _show_editing_help(self):
+        """Show a dialog with editing instructions."""
+        text = (
+            "<h3>单帧拖拽编辑</h3>"
+            "<ol>"
+            "<li>勾选 <b>Edit Mode</b></li>"
+            "<li>点击关节并拖拽到目标位置（深度保持不变）</li>"
+            "<li>Ctrl+Z 撤销</li>"
+            "</ol>"
+            "<h3>双视角三角化（修正深度）</h3>"
+            "<ol>"
+            "<li>勾选 <b>Edit Mode</b> + <b>Triangulate (2-view)</b></li>"
+            "<li>在相机 A 拖拽关节到正确的 2D 位置 → 记录射线 1（青色 T1 标记）</li>"
+            "<li>切换到相机 B，拖拽同一关节 → 自动三角化得到精确 3D</li>"
+            "<li>提示：选择夹角大的两个相机效果最好</li>"
+            "</ol>"
+            "<h3>锚点插值（修正连续偏移）</h3>"
+            "<ol>"
+            "<li>跳到偏移起始帧，拖拽关节到正确位置 → 点 <b>Set Anchor</b></li>"
+            "<li>跳到偏移结束帧，拖拽同一关节 → 点 <b>Set Anchor</b></li>"
+            "<li>可以设置多个锚点，插值会依次经过每个锚点</li>"
+            "<li>选择 Method (spline/linear) → 点 <b>Apply Interpolation</b></li>"
+            "</ol>"
+            "<h3>批量偏移（整段平移）</h3>"
+            "<ol>"
+            "<li>在任意一帧拖拽关节到正确位置（记录 delta）</li>"
+            "<li>设置 From/To 帧范围</li>"
+            "<li>选择 Taper: none(均匀) / linear(线性衰减) / cosine(余弦衰减)</li>"
+            "<li>点 <b>Apply Last Drag as Offset</b></li>"
+            "</ol>"
+            "<h3>快捷键</h3>"
+            "<ul>"
+            "<li><b>Space</b> — 播放/暂停</li>"
+            "<li><b>A/D</b> — 前/后一帧</li>"
+            "<li><b>Q/E</b> — 前/后 1 秒</li>"
+            "<li><b>Ctrl+Z</b> — 撤销</li>"
+            "</ul>"
+        )
+        QMessageBox.information(self, "Editing Guide", text)
+
     # =======================================================================
     #  File loaders
     # =======================================================================
@@ -354,7 +397,7 @@ class ClipAnnotator(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e)); return
         self.xlsx_path = path
-        self.sheet_names = xl.sheet_names
+        self.sheet_names = [s for s in xl.sheet_names if s != "1A2B"]
         self._annotations = load_annotations(path)
         self.lbl_xlsx.setText(os.path.basename(path))
         self.scene_combo.blockSignals(True)
@@ -802,6 +845,16 @@ class ClipAnnotator(QMainWindow):
                     if self._drag_joint is not None and self._drag_joint < len(proj):
                         jx, jy = int(proj[self._drag_joint][0]), int(proj[self._drag_joint][1])
                         cv2.circle(frame, (jx, jy), 8, (0, 255, 0), 2)
+                    # Highlight pending triangulation joint (cyan + "T1")
+                    if (self._pending_ray is not None
+                            and self._pending_ray["pidx"] == pidx
+                            and self._pending_ray["joint"] < len(proj)):
+                        tj = self._pending_ray["joint"]
+                        tx, ty = int(proj[tj][0]), int(proj[tj][1])
+                        cv2.circle(frame, (tx, ty), 12, (255, 255, 0), 2)  # cyan in BGR
+                        cv2.putText(frame, "T1", (tx + 14, ty - 6),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                    (255, 255, 0), 2)
                     # Highlight anchor joints at this frame
                     for aj in self._anchors.all_joints():
                         if pidx in self._anchors.get_anchors(aj) and aj < len(proj):
@@ -840,16 +893,6 @@ class ClipAnnotator(QMainWindow):
     # =======================================================================
     def _on_mouse_press(self, fx, fy):
         """Mouse pressed on video at frame coords (fx, fy)."""
-        # Pick mode: select joint for propagation panel
-        if self.pick_joint_btn.isChecked():
-            if self._drag_proj is not None:
-                joint = find_nearest_joint(fx, fy, self._drag_proj)
-                if joint is not None:
-                    self.joint_spin.setValue(joint)
-                    self.pick_joint_btn.setChecked(False)
-                    self.statusBar().showMessage(f"Selected joint {joint} for propagation")
-            return
-
         if not self.edit_cb.isChecked():
             return
         if self._drag_proj is None or self._drag_pidx is None:
@@ -858,6 +901,9 @@ class ClipAnnotator(QMainWindow):
             self._toggle_play()  # pause during editing
         joint = find_nearest_joint(fx, fy, self._drag_proj)
         if joint is not None:
+            # Always update selected joint for propagation panel
+            self._selected_joint = joint
+            self.joint_lbl.setText(f"Joint {joint}")
             self._drag_joint = joint
             # Save old position for undo BEFORE any move
             pidx = self._drag_pidx
@@ -1064,7 +1110,11 @@ class ClipAnnotator(QMainWindow):
                        self.pts3d.shape[0], total_off)
         else:
             pidx = self._drag_pidx
-        joint = self.joint_spin.value()
+        joint = self._selected_joint
+        if joint is None:
+            QMessageBox.warning(self, "Warning",
+                                "No joint selected. Click a joint in the view first.")
+            return
         if joint >= self.pts3d.shape[1]:
             QMessageBox.warning(self, "Warning",
                                 f"Joint {joint} out of range (max {self.pts3d.shape[1]-1}).")
@@ -1088,7 +1138,11 @@ class ClipAnnotator(QMainWindow):
         total_off = self.scene_offset + self._get_effective_act_offset(self.cur_act)
         pidx = v2p(self.cur_frame, self.vfps, self.pfps,
                    self.pts3d.shape[0], total_off)
-        joint = self.joint_spin.value()
+        joint = self._selected_joint
+        if joint is None:
+            QMessageBox.warning(self, "Warning",
+                                "No joint selected. Click a joint in the view first.")
+            return
         self._anchors.remove_anchor(joint, pidx)
         self._refresh_anchor_list()
         self.statusBar().showMessage(
@@ -1099,7 +1153,8 @@ class ClipAnnotator(QMainWindow):
         summary = self._anchors.summary()
         if row < 0 or row >= len(summary): return
         joint, frame, _ = summary[row]
-        self.joint_spin.setValue(joint)
+        self._selected_joint = joint
+        self.joint_lbl.setText(f"Joint {joint}")
         # Convert pts3d frame back to video frame (approximate inverse of v2p)
         if self.pts3d is not None and self.pfps > 0 and self.vfps > 0:
             total_off = self.scene_offset + self._get_effective_act_offset(self.cur_act)
@@ -1113,7 +1168,11 @@ class ClipAnnotator(QMainWindow):
         """Apply anchor-based interpolation across the frame range."""
         if self.pts3d is None:
             QMessageBox.warning(self, "Warning", "No 3D data loaded."); return
-        joint = self.joint_spin.value()
+        joint = self._selected_joint
+        if joint is None:
+            QMessageBox.warning(self, "Warning",
+                                "No joint selected. Click a joint in the view first.")
+            return
         anchors = self._anchors.get_anchors(joint)
         if not anchors:
             QMessageBox.warning(self, "Warning",
@@ -1149,7 +1208,11 @@ class ClipAnnotator(QMainWindow):
                                 "No drag recorded yet.\n"
                                 "Drag a joint first, then use this button.")
             return
-        joint = self.joint_spin.value()
+        joint = self._selected_joint
+        if joint is None:
+            QMessageBox.warning(self, "Warning",
+                                "No joint selected. Click a joint in the view first.")
+            return
         if self._last_drag_joint is not None and joint != self._last_drag_joint:
             reply = QMessageBox.question(
                 self, "Joint Mismatch",
