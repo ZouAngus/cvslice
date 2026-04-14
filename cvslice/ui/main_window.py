@@ -90,6 +90,9 @@ class ClipAnnotator(QMainWindow):
         # Two-view triangulation state
         self._pending_ray: dict | None = None  # {joint, pidx, cam, origin, direction, old_xyz}
 
+        # Per-camera view offset: {scene_name: {cam_name: int}}
+        self._view_offsets: dict[str, dict[str, int]] = {}
+
         # All-joints keyframe state
         self._kf_a: int | None = None  # pts3d frame index for keyframe A
         self._kf_b: int | None = None  # pts3d frame index for keyframe B
@@ -202,6 +205,14 @@ class ClipAnnotator(QMainWindow):
         self.act_off_spin = QSpinBox(); self.act_off_spin.setRange(-50000, 50000)
         self.act_off_spin.valueChanged.connect(self._on_act_off)
         of2.addRow("Action:", self.act_off_spin)
+        self.view_off_spin = QSpinBox(); self.view_off_spin.setRange(-50000, 50000)
+        self.view_off_spin.valueChanged.connect(self._on_view_off)
+        of2.addRow("View:", self.view_off_spin)
+        sync_help_btn = QPushButton("❓")
+        sync_help_btn.setFixedWidth(32)
+        sync_help_btn.setToolTip("Offset 说明")
+        sync_help_btn.clicked.connect(self._show_sync_help)
+        of2.addRow("", sync_help_btn)
         rv.addWidget(og)
 
         ag = QGroupBox("Action Override"); af = QFormLayout(ag)
@@ -310,15 +321,31 @@ class ClipAnnotator(QMainWindow):
         self.anchor_list.currentRowChanged.connect(self._on_anchor_selected)
         pfl.addWidget(self.anchor_list)
 
-        # Range for interpolation
+        # Range for interpolation (pts3d frame indices)
         rform = QFormLayout()
         self.prop_start_spin = QSpinBox()
         self.prop_start_spin.setRange(0, 9999999)
-        rform.addRow("From:", self.prop_start_spin)
+        rform.addRow("From (3D):", self.prop_start_spin)
         self.prop_end_spin = QSpinBox()
         self.prop_end_spin.setRange(0, 9999999)
-        rform.addRow("To:", self.prop_end_spin)
+        rform.addRow("To (3D):", self.prop_end_spin)
         pfl.addLayout(rform)
+        self.prop_range_hint = QLabel("")
+        self.prop_range_hint.setStyleSheet("font-size:11px; color:#888;")
+        self.prop_range_hint.setWordWrap(True)
+        pfl.addWidget(self.prop_range_hint)
+        # Connect spinbox changes to update hint
+        self.prop_start_spin.valueChanged.connect(self._update_prop_range_hint)
+        self.prop_end_spin.valueChanged.connect(self._update_prop_range_hint)
+
+        # Feedback label for apply operations
+        self.prop_feedback_lbl = QLabel("")
+        self.prop_feedback_lbl.setStyleSheet("font-size:12px; font-weight:bold; color:#4CAF50;")
+        self.prop_feedback_lbl.setWordWrap(True)
+        pfl.addWidget(self.prop_feedback_lbl)
+        self._feedback_timer = QTimer()
+        self._feedback_timer.setSingleShot(True)
+        self._feedback_timer.timeout.connect(lambda: self.prop_feedback_lbl.setText(""))
 
         # Method selector
         mrow = QHBoxLayout()
@@ -528,9 +555,13 @@ class ClipAnnotator(QMainWindow):
             self.scene_offset = saved.get("scene_offset", 0)
             saved_ov = saved.get("overrides", {})
             self.overrides = {int(k): v for k, v in saved_ov.items()}
+            saved_vo = saved.get("view_offsets", {})
+            if saved_vo:
+                self._view_offsets[scene_name] = dict(saved_vo)
 
         self._suppress_spin = True
         self.scene_off_spin.setValue(self.scene_offset)
+        self.view_off_spin.setValue(0)
         self._suppress_spin = False
 
         info_parts = []
@@ -584,6 +615,7 @@ class ClipAnnotator(QMainWindow):
         scene_data = {
             "scene_offset": self.scene_offset,
             "overrides": {str(k): v for k, v in self.overrides.items()},
+            "view_offsets": self._view_offsets.get(self.cur_scene, {}),
         }
         self._annotations[self.cur_scene] = scene_data
         save_annotations(self.xlsx_path, self._annotations)
@@ -620,6 +652,10 @@ class ClipAnnotator(QMainWindow):
                     self.vtotal = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
                     self._estimate_pfps()
                 break
+        # Load view offset for this camera
+        self._suppress_spin = True
+        self.view_off_spin.setValue(self._get_view_offset())
+        self._suppress_spin = False
         self._read_frame(self.cur_frame)
         self._show_frame()
 
@@ -778,6 +814,40 @@ class ClipAnnotator(QMainWindow):
         self.scene_offset = val
         self._show_frame(); self._auto_save()
 
+    def _on_view_off(self, val):
+        """Store per-camera view offset for the current scene + camera."""
+        if self._suppress_spin: return
+        if not self.cur_scene or not self.active_cam: return
+        self._view_offsets.setdefault(self.cur_scene, {})[self.active_cam] = val
+        self._show_frame(); self._auto_save()
+
+    def _get_view_offset(self) -> int:
+        """Get the view offset for the current scene + camera."""
+        if not self.cur_scene or not self.active_cam:
+            return 0
+        return self._view_offsets.get(self.cur_scene, {}).get(self.active_cam, 0)
+
+    def _show_sync_help(self):
+        """Show explanation of the three offset types."""
+        text = (
+            "<h3>Sync Offset 说明</h3>"
+            "<p>三个 offset 用于对齐 3D 骨架数据与视频帧：</p>"
+            "<ul>"
+            "<li><b>Scene</b> — 场景级别的全局偏移，影响该场景下所有 action 和所有相机视角。"
+            "当整个场景的 3D 数据与视频整体偏移时使用。</li>"
+            "<li><b>Action</b> — 单个 action 的偏移，仅影响当前选中的 action。"
+            "当某个动作片段的 3D 数据与视频局部不对齐时使用。"
+            "未设置的 action 会继承前一个 action 的值。</li>"
+            "<li><b>View</b> — 当前相机视角的偏移，仅影响当前视角。"
+            "当某个相机的视频与其他相机有帧偏差时使用。"
+            "切换相机时会自动加载该视角的值。</li>"
+            "</ul>"
+            "<p><b>总偏移 = Scene + Action + View</b></p>"
+            "<p>调整顺序建议：先调 Scene 对齐大部分视角，"
+            "再用 View 微调个别视角的偏差。</p>"
+        )
+        QMessageBox.information(self, "Sync Offset 说明", text)
+
     def _on_cam(self, text):
         if text and text != self.active_cam and text != "(no cameras)":
             self._switch_cam(text)
@@ -869,7 +939,7 @@ class ClipAnnotator(QMainWindow):
         self._drag_pidx = None
         if need_skel:
             intr, extr = self.calibs[self.active_cam]
-            total_off = self.scene_offset + self._get_effective_act_offset(self.cur_act)
+            total_off = self.scene_offset + self._get_effective_act_offset(self.cur_act) + self._get_view_offset()
             pidx = v2p(self.cur_frame, self.vfps, self.pfps,
                        self.pts3d.shape[0], total_off)
             pts = self.pts3d[pidx]
@@ -1145,7 +1215,7 @@ class ClipAnnotator(QMainWindow):
         """Get the pts3d frame index for the current video frame."""
         if self.pts3d is None:
             return None
-        total_off = self.scene_offset + self._get_effective_act_offset(self.cur_act)
+        total_off = self.scene_offset + self._get_effective_act_offset(self.cur_act) + self._get_view_offset()
         return v2p(self.cur_frame, self.vfps, self.pfps,
                    self.pts3d.shape[0], total_off)
 
@@ -1181,6 +1251,26 @@ class ClipAnnotator(QMainWindow):
         else:
             self.kf_status_lbl.setText("")
 
+    def _update_prop_range_hint(self):
+        """Show video frame equivalents for the pts3d From/To range."""
+        if self.pts3d is None or self.pfps <= 0 or self.vfps <= 0:
+            self.prop_range_hint.setText("")
+            return
+        fs = self.prop_start_spin.value()
+        fe = self.prop_end_spin.value()
+        total_off = self.scene_offset + self._get_effective_act_offset(self.cur_act) + self._get_view_offset()
+        # Approximate inverse: video_frame = pts3d_frame * (vfps/pfps) - total_off
+        ratio = self.vfps / self.pfps
+        vf_s = int(round(fs * ratio - total_off))
+        vf_e = int(round(fe * ratio - total_off))
+        self.prop_range_hint.setText(
+            f"≈ 视频帧 {vf_s}–{vf_e}  (共 {fe - fs + 1} 个 3D 帧)")
+
+    def _show_prop_feedback(self, text: str, duration_ms: int = 3000):
+        """Show a brief feedback message in the propagation panel."""
+        self.prop_feedback_lbl.setText(text)
+        self._feedback_timer.start(duration_ms)
+
     def _refresh_anchor_list(self):
         """Refresh the anchor list widget."""
         self.anchor_list.clear()
@@ -1194,7 +1284,7 @@ class ClipAnnotator(QMainWindow):
             QMessageBox.warning(self, "Warning", "No 3D data loaded."); return
         if self._drag_pidx is None:
             # Compute pidx from current frame
-            total_off = self.scene_offset + self._get_effective_act_offset(self.cur_act)
+            total_off = self.scene_offset + self._get_effective_act_offset(self.cur_act) + self._get_view_offset()
             pidx = v2p(self.cur_frame, self.vfps, self.pfps,
                        self.pts3d.shape[0], total_off)
         else:
@@ -1224,7 +1314,7 @@ class ClipAnnotator(QMainWindow):
     def _del_anchor(self):
         """Remove anchor at current frame for selected joint."""
         if self.pts3d is None: return
-        total_off = self.scene_offset + self._get_effective_act_offset(self.cur_act)
+        total_off = self.scene_offset + self._get_effective_act_offset(self.cur_act) + self._get_view_offset()
         pidx = v2p(self.cur_frame, self.vfps, self.pfps,
                    self.pts3d.shape[0], total_off)
         joint = self._selected_joint
@@ -1246,7 +1336,7 @@ class ClipAnnotator(QMainWindow):
         self.joint_lbl.setText(f"Joint {joint}")
         # Convert pts3d frame back to video frame (approximate inverse of v2p)
         if self.pts3d is not None and self.pfps > 0 and self.vfps > 0:
-            total_off = self.scene_offset + self._get_effective_act_offset(self.cur_act)
+            total_off = self.scene_offset + self._get_effective_act_offset(self.cur_act) + self._get_view_offset()
             vframe = int(round(frame * (self.vfps / self.pfps) - total_off))
             vframe = max(self.clip_start, min(self.clip_end, vframe))
             self.cur_frame = vframe
@@ -1275,6 +1365,7 @@ class ClipAnnotator(QMainWindow):
             self.statusBar().showMessage(
                 f"Interpolated ALL joints across {n_frames} frames "
                 f"(F{fs}-F{fe}, {method}). Ctrl+Z to undo.")
+            self._show_prop_feedback(f"\u2714 已插值 {n_frames} 帧 (ALL joints, {method})")
         else:
             # Single-joint mode
             joint = self._selected_joint
@@ -1298,6 +1389,7 @@ class ClipAnnotator(QMainWindow):
             self.statusBar().showMessage(
                 f"Interpolated joint {joint} across {n_frames} frames "
                 f"({len(anchors)} anchors, {method}). Ctrl+Z to undo.")
+            self._show_prop_feedback(f"\u2714 已插值 J{joint}, {n_frames} 帧 ({method})")
         self._show_frame()
 
     def _apply_bulk_offset(self):
@@ -1330,6 +1422,7 @@ class ClipAnnotator(QMainWindow):
             self.statusBar().showMessage(
                 f"Offset applied to ALL joints across {n_frames} frames "
                 f"(delta=[{d[0]:.1f},{d[1]:.1f},{d[2]:.1f}], taper={taper}). Ctrl+Z to undo.")
+            self._show_prop_feedback(f"\u2714 已偏移 {n_frames} 帧 (ALL joints, {taper})")
         else:
             # Single-joint mode
             joint = self._selected_joint
@@ -1356,6 +1449,7 @@ class ClipAnnotator(QMainWindow):
             self.statusBar().showMessage(
                 f"Offset applied to joint {joint} across {n_frames} frames "
                 f"(delta=[{d[0]:.1f},{d[1]:.1f},{d[2]:.1f}], taper={taper}). Ctrl+Z to undo.")
+            self._show_prop_feedback(f"\u2714 已偏移 J{joint}, {n_frames} 帧 ({taper})")
         self._show_frame()
 
     def _clear_anchors(self):
