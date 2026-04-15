@@ -441,9 +441,45 @@ class ClipAnnotator(QMainWindow):
             f"\u2714 Ray 1: {joints_str} @ {cam}\n"
             f"\u5207\u6362\u76f8\u673a\uff0c\u62d6\u62fd\u540c\u4e00\u5173\u8282\u5b8c\u6210\u4e09\u89d2\u5316")
 
+    # Editing guide language preference (persists within session)
+    _help_lang = "zh"
+
     def _show_editing_help(self):
-        """Show a dialog with editing instructions."""
-        text = (
+        """Show a dialog with editing instructions, with CN/EN toggle."""
+        from PyQt5.QtWidgets import QDialog, QDialogButtonBox, QTextBrowser
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Editing Guide")
+        dlg.setMinimumSize(560, 520)
+        lay = QVBoxLayout(dlg)
+
+        lang_btn = QPushButton("Switch to English" if self._help_lang == "zh" else "切换到中文")
+        lang_btn.setFixedWidth(160)
+        lay.addWidget(lang_btn)
+
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(False)
+        lay.addWidget(browser)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok)
+        btns.accepted.connect(dlg.accept)
+        lay.addWidget(btns)
+
+        def _set_text():
+            browser.setHtml(self._help_text_zh() if self._help_lang == "zh" else self._help_text_en())
+            lang_btn.setText("Switch to English" if self._help_lang == "zh" else "切换到中文")
+
+        def _toggle():
+            self._help_lang = "en" if self._help_lang == "zh" else "zh"
+            _set_text()
+
+        lang_btn.clicked.connect(_toggle)
+        _set_text()
+        dlg.exec_()
+
+    @staticmethod
+    def _help_text_zh() -> str:
+        return (
             "<h3>全关节插值（推荐，最省力）</h3>"
             "<ol>"
             "<li>勾选 <b>All Joints</b>（默认已勾选）</li>"
@@ -498,7 +534,64 @@ class ClipAnnotator(QMainWindow):
             "<li><b>中键双击 / Ctrl+双击</b> — 重置视图</li>"
             "</ul>"
         )
-        QMessageBox.information(self, "Editing Guide", text)
+
+    @staticmethod
+    def _help_text_en() -> str:
+        return (
+            "<h3>All-Joint Interpolation (Recommended)</h3>"
+            "<ol>"
+            "<li>Check <b>All Joints</b> (on by default)</li>"
+            "<li>Go to the start frame, adjust joints → click <b>Add Keyframe</b></li>"
+            "<li>Add multiple keyframes (A, B, C, D...) — interpolation passes through each</li>"
+            "<li>Choose Method (spline/linear) → click <b>Apply Interpolation</b></li>"
+            "<li>All joints between keyframes are smoothly interpolated</li>"
+            "</ol>"
+            "<h3>Single-Frame Drag Edit</h3>"
+            "<ol>"
+            "<li>Check <b>Edit Mode</b></li>"
+            "<li>Click and drag a joint to the target position (depth is preserved)</li>"
+            "<li>Ctrl+Z to undo</li>"
+            "</ol>"
+            "<h3>Two-View Triangulation (Fix Depth)</h3>"
+            "<ol>"
+            "<li>Check <b>Edit Mode</b> + <b>Triangulate (2-view)</b></li>"
+            "<li>In camera A, drag joint(s) to correct 2D position → ray recorded (cyan T1 marker)</li>"
+            "<li>Switch to camera B, drag the same joint → auto-triangulates to precise 3D</li>"
+            "<li>Batch: drag multiple joints in cam A, then complete each in cam B</li>"
+            "<li>View offsets across cameras are handled automatically</li>"
+            "<li>Tip: choose two cameras with a large angle between them</li>"
+            "</ol>"
+            "<h3>Anchor Interpolation (Fix Continuous Drift)</h3>"
+            "<ol>"
+            "<li>Go to drift start, drag joint to correct position → click <b>Set Anchor</b></li>"
+            "<li>Go to drift end, drag same joint → click <b>Set Anchor</b></li>"
+            "<li>Add more anchors as needed — interpolation passes through each</li>"
+            "<li>Choose Method (spline/linear) → click <b>Apply Interpolation</b></li>"
+            "</ol>"
+            "<h3>Bulk Offset (Shift Entire Segment)</h3>"
+            "<ol>"
+            "<li>Drag a joint to the correct position on any frame (records delta)</li>"
+            "<li>Set From/To frame range</li>"
+            "<li>Choose Taper: none (uniform) / linear (fade) / cosine (smooth fade)</li>"
+            "<li>Click <b>Apply Last Drag as Offset</b></li>"
+            "</ol>"
+            "<h3>Keyboard Shortcuts</h3>"
+            "<ul>"
+            "<li><b>Space</b> — Play / Pause</li>"
+            "<li><b>A/D</b> — Previous / Next frame</li>"
+            "<li><b>Shift+A/D</b> — ±5 frames</li>"
+            "<li><b>Q/E</b> — ±1 second</li>"
+            "<li><b>1-7</b> — Switch camera view</li>"
+            "<li><b>Home/End</b> — Jump to clip start / end</li>"
+            "<li><b>Tab</b> — Toggle Edit Mode</li>"
+            "<li><b>K</b> — Add keyframe</li>"
+            "<li><b>R</b> — Reset zoom / pan</li>"
+            "<li><b>Ctrl+Z</b> — Undo</li>"
+            "<li><b>Ctrl+Scroll</b> — Zoom view</li>"
+            "<li><b>Middle-drag / Ctrl+drag</b> — Pan view</li>"
+            "<li><b>Middle double-click / Ctrl+double-click</b> — Reset view</li>"
+            "</ul>"
+        )
 
     # =======================================================================
     #  File loaders
