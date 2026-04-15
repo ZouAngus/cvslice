@@ -93,6 +93,7 @@ class ClipAnnotator(QMainWindow):
 
         # Per-camera view offset: {scene_name: {cam_name: int}}
         self._view_offsets: dict[str, dict[str, int]] = {}
+        self._offset_mode = "skeleton"  # "skeleton" (default/legacy) or "video"
 
         # All-joints keyframe state
         self._keyframes: list[int] = []  # sorted pts3d frame indices for keyframes
@@ -225,7 +226,16 @@ class ClipAnnotator(QMainWindow):
         sync_help_btn.setFixedWidth(32)
         sync_help_btn.setToolTip("Offset 说明")
         sync_help_btn.clicked.connect(self._show_sync_help)
-        of2.addRow("", sync_help_btn)
+        self.offset_mode_combo = QComboBox()
+        self.offset_mode_combo.addItems(["Adjust Skeleton", "Adjust Video"])
+        self.offset_mode_combo.setToolTip(
+            "Adjust Skeleton: offset 调整骨架读取帧（默认，兼容老版本）\n"
+            "Adjust Video: offset 调整视频帧，切换相机时骨架帧不变")
+        self.offset_mode_combo.currentIndexChanged.connect(self._on_offset_mode_changed)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(sync_help_btn)
+        mode_row.addWidget(self.offset_mode_combo)
+        of2.addRow("", mode_row)
         rv.addWidget(og)
 
         ag = QGroupBox("Action Override"); af = QFormLayout(ag)
@@ -668,10 +678,13 @@ class ClipAnnotator(QMainWindow):
             saved_vo = saved.get("view_offsets", {})
             if saved_vo:
                 self._view_offsets[scene_name] = dict(saved_vo)
+            # Load offset mode (default "skeleton" for legacy compatibility)
+            self._offset_mode = saved.get("offset_mode", "skeleton")
 
         self._suppress_spin = True
         self.scene_off_spin.setValue(self.scene_offset)
         self.view_off_spin.setValue(0)
+        self.offset_mode_combo.setCurrentIndex(1 if self._offset_mode == "video" else 0)
         self._suppress_spin = False
 
         info_parts = []
@@ -726,6 +739,7 @@ class ClipAnnotator(QMainWindow):
             "scene_offset": self.scene_offset,
             "overrides": {str(k): v for k, v in self.overrides.items()},
             "view_offsets": self._view_offsets.get(self.cur_scene, {}),
+            "offset_mode": self._offset_mode,
         }
         self._annotations[self.cur_scene] = scene_data
         save_annotations(self.xlsx_path, self._annotations)
@@ -776,8 +790,9 @@ class ClipAnnotator(QMainWindow):
         self.view_off_spin.setValue(self._get_view_offset())
         self._suppress_spin = False
 
-        # Anchor skeleton: compute new video frame for same pidx under new view offset
-        if old_pidx is not None and self.vfps > 0 and self.pfps > 0:
+        # Anchor skeleton (video mode): compute new video frame for same pidx
+        if (self._offset_mode == "video"
+                and old_pidx is not None and self.vfps > 0 and self.pfps > 0):
             sync_off = self.scene_offset + self._get_effective_act_offset(self.cur_act)
             new_view_off = self._get_view_offset()
             total_off_new = sync_off + new_view_off
@@ -959,6 +974,13 @@ class ClipAnnotator(QMainWindow):
         if not self.cur_scene or not self.active_cam:
             return 0
         return self._view_offsets.get(self.cur_scene, {}).get(self.active_cam, 0)
+
+    def _on_offset_mode_changed(self, idx):
+        """Switch between skeleton-adjust and video-adjust offset modes."""
+        self._offset_mode = "video" if idx == 1 else "skeleton"
+        # Persist to annotations
+        self._auto_save()
+        self._show_frame()
 
     def _show_sync_help(self):
         """Show explanation of the three offset types."""
