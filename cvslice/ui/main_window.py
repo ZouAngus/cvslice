@@ -1199,16 +1199,13 @@ class ClipAnnotator(QMainWindow):
         else:
             if not self.cap and self.pts3d is None: return
             self.playing = True
-            if self.cap:
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.cur_frame)
+            # No need to manually set cap position - _read_frame handles offset
             self.timer.start(int(1000 / self.vfps))
 
     def _tick(self):
         if self.cur_frame >= self.clip_end:
             if self.loop_playback:
                 self.cur_frame = self.clip_start
-                if self.cap and self.cap.isOpened():
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.cur_frame)
                 self._read_frame(self.cur_frame)
                 self.slider.blockSignals(True)
                 self.slider.setValue(self.cur_frame)
@@ -1218,16 +1215,12 @@ class ClipAnnotator(QMainWindow):
             else:
                 self.playing = False; self.timer.stop(); return
         self.cur_frame += 1
-        if self.cap and self.cap.isOpened():
-            ret, frame = self.cap.read()
-            if ret:
-                self._cached_frame_idx = self.cur_frame
-                self._cached_frame = frame
-        else:
-            self._cached_frame_idx = self.cur_frame
+        # Use _read_frame to properly handle offset
+        self._read_frame(self.cur_frame)
         self.slider.blockSignals(True)
         self.slider.setValue(self.cur_frame)
         self.slider.blockSignals(False)
+        self._show_frame()
         self._show_frame()
 
     def _prev(self):
