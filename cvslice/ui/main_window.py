@@ -1126,8 +1126,9 @@ class ClipAnnotator(QMainWindow):
         min_off = min(offs)
         max_off = max(offs)
         margin = 3
-        pre = max(0, -min_off) + margin
-        post = max(0, max_off) + margin
+        max_padding = 20
+        pre = min(max(0, -min_off) + margin, max_padding)
+        post = min(max(0, max_off) + margin, max_padding)
         return pre, post, min_off, max_off
 
     def _update_padding_ui(self, *_args):
