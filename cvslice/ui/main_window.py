@@ -21,6 +21,7 @@ from ..io import (
     find_csv_for_scene, find_cameras_in_folder, load_csv_as_pts3d,
     annotations_path, load_annotations, save_annotations,
 )
+from ..io.discovery import scene_name_matches
 from ..vision import (
     project_pts, draw_skel, draw_skel_with_confidence, clear_projection_cache,
     unproject_2d_to_3d, get_camera_depth, extract_R_t, find_nearest_joint,
@@ -803,19 +804,15 @@ class ClipAnnotator(QMainWindow):
 
     def _find_video_for_cam(self, cam_name: str) -> str | None:
         """Find the video file for *cam_name* in video_folder, preferring
-        files that also match the current scene name."""
+        files that also match the current scene name or a known alias."""
         if not self.video_folder or not os.path.isdir(self.video_folder):
             return None
-        import re
-        scene_key = re.sub(r'[^a-z0-9]', '', (self.cur_scene or '').lower())
-        # First pass: match both scene and camera
-        if scene_key:
+        # First pass: match both scene (with aliases) and camera
+        if self.cur_scene:
             for fn in sorted(os.listdir(self.video_folder)):
                 fl = fn.lower()
-                if fl.endswith(".mp4") and cam_name in fl:
-                    fk = re.sub(r'[^a-z0-9]', '', fl)
-                    if scene_key in fk:
-                        return os.path.join(self.video_folder, fn)
+                if fl.endswith(".mp4") and cam_name in fl and scene_name_matches(fl, self.cur_scene):
+                    return os.path.join(self.video_folder, fn)
         # Fallback: match camera only (single-scene folders)
         for fn in sorted(os.listdir(self.video_folder)):
             fl = fn.lower()

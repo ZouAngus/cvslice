@@ -6,27 +6,50 @@ import pandas as pd
 from ..core.constants import CAMERA_NAMES
 
 
+_SCENE_ALIASES = {
+    "sword": {"sword", "elsdon"},
+    "elsdon": {"sword", "elsdon"},
+}
+
+
 def _normalize_scene_key(name: str) -> str:
     return re.sub(r'[^a-z0-9]', '', name.lower())
+
+
+def scene_keys(name: str | None) -> set[str]:
+    """Return normalized scene keys including known aliases."""
+    key = _normalize_scene_key(name or "")
+    if not key:
+        return set()
+    return set(_SCENE_ALIASES.get(key, {key}))
+
+
+def scene_name_matches(candidate: str, scene_name: str | None) -> bool:
+    """True if *candidate* matches *scene_name* or one of its aliases."""
+    cand = _normalize_scene_key(candidate)
+    if not cand:
+        return False
+    keys = scene_keys(scene_name)
+    if not keys:
+        return True
+    return any(k in cand or cand in k for k in keys)
 
 
 def find_data_subfolder(data_root: str, sheet_name: str) -> str | None:
     """Find the data subfolder matching a scene name."""
     if not data_root or not os.path.isdir(data_root):
         return None
-    key = _normalize_scene_key(sheet_name)
-    # Exact match
+    keys = scene_keys(sheet_name)
+    # Exact/alias match
     for entry in sorted(os.listdir(data_root)):
         full = os.path.join(data_root, entry)
-        if os.path.isdir(full) and _normalize_scene_key(entry) == key:
+        if os.path.isdir(full) and _normalize_scene_key(entry) in keys:
             return full
-    # Fuzzy match
+    # Fuzzy match with aliases
     for entry in sorted(os.listdir(data_root)):
         full = os.path.join(data_root, entry)
-        if os.path.isdir(full):
-            ek = _normalize_scene_key(entry)
-            if key in ek or ek in key:
-                return full
+        if os.path.isdir(full) and scene_name_matches(entry, sheet_name):
+            return full
     return None
 
 
@@ -54,15 +77,13 @@ def find_csv_for_scene(data_root: str, sheet_name: str) -> tuple[str | None, str
     # 2. CSV in data root matching scene name
     csv_path = None
     if data_root and os.path.isdir(data_root):
-        key = _normalize_scene_key(sheet_name)
         for fn in sorted(os.listdir(data_root)):
             if not fn.lower().endswith(".csv"):
                 continue
             if not fn.lower().startswith("extracted"):
                 continue
-            fk = _normalize_scene_key(
-                os.path.splitext(fn)[0].replace("extracted", "").strip("_"))
-            if key in fk or fk in key:
+            fk = os.path.splitext(fn)[0].replace("extracted", "").strip("_")
+            if scene_name_matches(fk, sheet_name):
                 csv_path = os.path.join(data_root, fn)
                 break
     return csv_path, subfolder
@@ -76,7 +97,7 @@ def find_cameras_in_folder(folder: str, scene_hint: str | None = None) -> list[s
     """
     if not folder or not os.path.isdir(folder):
         return []
-    scene_key = _normalize_scene_key(scene_hint) if scene_hint else None
+    scene_hint_present = bool(scene_hint)
     cams = []
     for cn in CAMERA_NAMES:
         for fn in os.listdir(folder):
@@ -85,7 +106,7 @@ def find_cameras_in_folder(folder: str, scene_hint: str | None = None) -> list[s
                 continue
             if cn not in fl:
                 continue
-            if scene_key and scene_key not in _normalize_scene_key(fl):
+            if scene_hint_present and not scene_name_matches(fl, scene_hint):
                 continue
             cams.append(cn)
             break
