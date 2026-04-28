@@ -1221,7 +1221,6 @@ class ClipAnnotator(QMainWindow):
         self.slider.setValue(self.cur_frame)
         self.slider.blockSignals(False)
         self._show_frame()
-        self._show_frame()
 
     def _prev(self):
         if self.playing: self._toggle_play()
@@ -1598,12 +1597,17 @@ class ClipAnnotator(QMainWindow):
     #  Propagation (multi-frame editing)
     # =======================================================================
     def _get_current_pidx(self) -> int | None:
-        """Get the pts3d frame index for the current video frame."""
+        """Get the pts3d frame index for the current video frame.
+
+        cur_frame is on the canonical timeline — the same timeline that
+        _show_frame uses for skeleton mapping.  Video offset only shifts
+        which raw video frame is read, NOT the skeleton mapping, so we
+        must NOT subtract it here.
+        """
         if self.pts3d is None:
             return None
-        raw_vf = self.cur_frame - self._get_total_video_off()
         skel_off = self._skeleton_offset.get(self.cur_scene, 0)
-        return v2p(raw_vf, self.vfps, self.pfps,
+        return v2p(self.cur_frame, self.vfps, self.pfps,
                    self.pts3d.shape[0], skel_off)
 
     def _add_keyframe(self):
@@ -1679,10 +1683,9 @@ class ClipAnnotator(QMainWindow):
         self.kf_list.clear()
         ratio = self.vfps / self.pfps if (self.pfps > 0 and self.vfps > 0) else 1.0
         skel_off = self._skeleton_offset.get(self.cur_scene, 0)
-        vid_off = self._get_total_video_off()
         if self.all_joints_cb.isChecked():
             for i, pidx in enumerate(self._keyframes):
-                vf = int(round(pidx * ratio - skel_off)) + vid_off
+                vf = int(round(pidx * ratio - skel_off))
                 self.kf_list.addItem(f"KF{i+1}: 3D F{pidx} (\u2248video {vf})")
             n = len(self._keyframes)
             self.kf_status_lbl.setText(f"{n} keyframe(s) set" if n else "")
@@ -1693,7 +1696,7 @@ class ClipAnnotator(QMainWindow):
                 anchors = self._anchors.get_anchors(joint)
                 if anchors:
                     for i, (pidx, xyz) in enumerate(sorted(anchors.items())):
-                        vf = int(round(pidx * ratio - skel_off)) + vid_off
+                        vf = int(round(pidx * ratio - skel_off))
                         self.kf_list.addItem(
                             f"J{joint} KF{i+1}: 3D F{pidx} (\u2248video {vf})")
                 n = len(anchors) if anchors else 0
@@ -1702,7 +1705,7 @@ class ClipAnnotator(QMainWindow):
             else:
                 # Show all anchors across all joints
                 for joint_a, frame, xyz in self._anchors.summary():
-                    vf = int(round(frame * ratio - skel_off)) + vid_off
+                    vf = int(round(frame * ratio - skel_off))
                     self.kf_list.addItem(
                         f"J{joint_a} @ 3D F{frame} (\u2248video {vf})")
                 total = len(self._anchors.summary())
@@ -1733,9 +1736,9 @@ class ClipAnnotator(QMainWindow):
                     pidx = frame
         if pidx is not None and self.pts3d is not None and self.pfps > 0 and self.vfps > 0:
             skel_off = self._skeleton_offset.get(self.cur_scene, 0)
-            raw_vf = int(round(pidx * (self.vfps / self.pfps) - skel_off))
-            # Add video offset to get actual frame position in clip range
-            vframe = raw_vf + self._get_total_video_off()
+            # Inverse of v2p: cur_frame lives on the canonical timeline
+            # (same as _show_frame), so no video offset is added.
+            vframe = int(round(pidx * (self.vfps / self.pfps) - skel_off))
             vframe = max(self.clip_start, min(self.clip_end, vframe))
             self.cur_frame = vframe
             self._read_frame(vframe)
@@ -1749,11 +1752,11 @@ class ClipAnnotator(QMainWindow):
         fs = self.prop_start_spin.value()
         fe = self.prop_end_spin.value()
         skel_off = self._skeleton_offset.get(self.cur_scene, 0)
-        vid_off = self._get_total_video_off()
-        # Approximate inverse: video_frame = pts3d_frame * (vfps/pfps) - skel_off + vid_off
+        # cur_frame is on the canonical timeline, not raw video,
+        # so we do NOT add video offset.
         ratio = self.vfps / self.pfps
-        vf_s = int(round(fs * ratio - skel_off)) + vid_off
-        vf_e = int(round(fe * ratio - skel_off)) + vid_off
+        vf_s = int(round(fs * ratio - skel_off))
+        vf_e = int(round(fe * ratio - skel_off))
         self.prop_range_hint.setText(
             f"≈ 视频帧 {vf_s}–{vf_e}  (共 {fe - fs + 1} 个 3D 帧)")
 
