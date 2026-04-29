@@ -736,7 +736,17 @@ class ClipAnnotator(QMainWindow):
                     if isinstance(cam_val, int):
                         migrated[cam_key] = {"0": cam_val}
                     elif isinstance(cam_val, dict):
-                        migrated[cam_key] = {str(k): v for k, v in cam_val.items()}
+                        clean = {}
+                        for k, v in cam_val.items():
+                            if isinstance(v, int):
+                                clean[str(k)] = v
+                            elif isinstance(v, (float, str)):
+                                try:
+                                    clean[str(k)] = int(v)
+                                except (ValueError, TypeError):
+                                    clean[str(k)] = 0
+                            # Skip dicts or other non-int values
+                        migrated[cam_key] = clean
                     else:
                         migrated[cam_key] = {}
                 self._view_offsets[scene_name] = migrated
@@ -1186,7 +1196,8 @@ class ClipAnnotator(QMainWindow):
         # Walk backwards to find the nearest set value
         for r in range(row, -1, -1):
             if str(r) in cam_dict:
-                return cam_dict[str(r)]
+                val = cam_dict[str(r)]
+                return val if isinstance(val, int) else int(val) if not isinstance(val, dict) else 0
         return 0
 
     def _get_view_offset_for(self, scene: str, cam: str,
@@ -1197,7 +1208,8 @@ class ClipAnnotator(QMainWindow):
             return 0
         for r in range(action_row, -1, -1):
             if str(r) in cam_dict:
-                return cam_dict[str(r)]
+                val = cam_dict[str(r)]
+                return val if isinstance(val, int) else int(val) if not isinstance(val, dict) else 0
         return 0
 
     def _get_total_video_off(self, action_row: int | None = None) -> int:
