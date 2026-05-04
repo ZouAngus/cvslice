@@ -287,6 +287,14 @@ class ClipAnnotator(QMainWindow):
         self.end_spin.setInputMethodHints(Qt.ImhDigitsOnly)
         self.end_spin.valueChanged.connect(self._on_end_ov)
         af.addRow("End:", self.end_spin)
+        # Read-only display of the actual clipped range after all offsets
+        # (scene + action + view). Spinboxes above stay in raw Excel frames.
+        self.eff_clip_lbl = QLabel("—")
+        self.eff_clip_lbl.setStyleSheet("color: #888;")
+        self.eff_clip_lbl.setToolTip(
+            "实际裁切帧 = Start/End + (scene + action + view offsets)\n"
+            "画面上看到的有效范围，隐式由上方 offset 控制")
+        af.addRow("实际裁切:", self.eff_clip_lbl)
         rv.addWidget(ag)
 
         fg = QGroupBox("Display"); ff = QFormLayout(fg)
@@ -1254,6 +1262,7 @@ class ClipAnnotator(QMainWindow):
         return pre, post, min_off, max_off
 
     def _update_padding_ui(self, *_args):
+        self._update_eff_clip_lbl()
         auto_on = self.auto_pad_cb.isChecked()
         self.pre_pad_spin.setEnabled(not auto_on)
         self.post_pad_spin.setEnabled(not auto_on)
@@ -1265,6 +1274,25 @@ class ClipAnnotator(QMainWindow):
                 f"Auto padding from total offsets: min {min_off}, max {max_off} → pre {pre}, post {post}")
         else:
             self.pad_info_lbl.setText("Manual padding override.")
+
+    def _update_eff_clip_lbl(self):
+        """Refresh the 'actual clipped range' label (raw + total video offset).
+
+        Display-only; does not alter clip_start/clip_end semantics.
+        """
+        if self.cur_act < 0:
+            self.eff_clip_lbl.setText("—")
+            return
+        a = self.actions[self.cur_act]
+        ov = self.overrides.get(self.cur_act, {})
+        raw_s = ov.get("start", a["start"])
+        raw_e = ov.get("end", a["end"])
+        total_off = self._get_total_video_off(self.cur_act)
+        eff_s = raw_s + total_off
+        eff_e = raw_e + total_off
+        sign = "+" if total_off >= 0 else "−"
+        self.eff_clip_lbl.setText(
+            f"{eff_s} – {eff_e}   (offset {sign}{abs(total_off)})")
 
     def _show_sync_help(self):
         """Show explanation of the offset types."""
