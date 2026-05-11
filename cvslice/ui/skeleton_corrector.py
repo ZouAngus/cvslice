@@ -62,6 +62,7 @@ class SkeletonCorrector(QMainWindow):
         self.vtotal: int = 0                          # video frame count (timeline)
         self.cur_frame: int = 0                       # video frame index
         self.pfps: float = 0.0                        # skeleton FPS (estimated)
+        self.frame_ratio: float = 1.0                 # local CSV frames per video frame
 
         # Action list parsed from folder
         # Each entry: {"tag": str, "csv": path, "videos": {cam: path}}
@@ -177,6 +178,9 @@ class SkeletonCorrector(QMainWindow):
         pb_row.addWidget(self.prev_btn)
         pb_row.addWidget(self.play_btn)
         pb_row.addWidget(self.next_btn)
+        self.loop_cb = QCheckBox("循环")
+        self.loop_cb.setChecked(True)
+        pb_row.addWidget(self.loop_cb)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setRange(0, 0)
         self.slider.valueChanged.connect(self._on_slider)
@@ -343,8 +347,12 @@ class SkeletonCorrector(QMainWindow):
     def _on_action_changed(self, idx: int) -> None:
         if idx < 0 or idx >= len(self._actions):
             return
-        # Save before switching? For now just switch.
+        was_playing = self.play_btn.isChecked()
+        if was_playing:
+            self.play_btn.setChecked(False)
         self._load_action(idx)
+        if was_playing:
+            self.play_btn.setChecked(True)
 
     def _load_action(self, idx: int) -> None:
         """Load a specific action by index."""
@@ -389,12 +397,19 @@ class SkeletonCorrector(QMainWindow):
         self.vfps = vfps
         self.vtotal = min_vtotal if min_vtotal > 0 else pts3d.shape[0]
 
-        # Estimate skeleton FPS from video duration
-        if self.vtotal > 0 and self.vfps > 0:
+        # Estimate skeleton FPS and frame ratio from exported clip
+        if self.vtotal > 1 and pts3d.shape[0] > 1:
+            # Use full-range ratio to avoid off-by-one drift
+            self.frame_ratio = (pts3d.shape[0] - 1) / (self.vtotal - 1)
             vid_duration = self.vtotal / self.vfps
             self.pfps = pts3d.shape[0] / vid_duration
+        elif self.vtotal > 0 and self.vfps > 0:
+            vid_duration = self.vtotal / self.vfps
+            self.pfps = pts3d.shape[0] / vid_duration
+            self.frame_ratio = self.pfps / self.vfps if self.vfps > 0 else 1.0
         else:
-            self.pfps = self.vfps  # fallback: assume 1:1
+            self.pfps = self.vfps
+            self.frame_ratio = 1.0
 
         self.cur_frame = 0
         self.undo_stack.clear()
@@ -436,21 +451,22 @@ class SkeletonCorrector(QMainWindow):
         if self.pts3d is None:
             return 0
         ptot = self.pts3d.shape[0]
-        if self.vfps <= 0 or self.pfps <= 0:
-            return max(0, min(ptot - 1, vframe))
-        idx = int(round(vframe * (self.pfps / self.vfps)))
+        idx = int(round(vframe * self.frame_ratio))
         return max(0, min(ptot - 1, idx))
 
     def _p2v(self, pidx: int) -> int:
         """Map pts3d (skeleton) frame index to video frame index."""
-        if self.pfps <= 0 or self.vfps <= 0:
+        if self.frame_ratio <= 0:
             return pidx
-        return int(round(pidx * (self.vfps / self.pfps)))
+        return int(round(pidx / self.frame_ratio))
 
     def _save(self) -> None:
         if self.pts3d is None or not self.csv_path:
             QMessageBox.information(self, "保存", "没有加载的数据可保存。")
             return
+        was_playing = self.play_btn.isChecked()
+        if was_playing:
+            self.play_btn.setChecked(False)
         bak = self.csv_path + ".bak"
         if not os.path.exists(bak):
             try:
@@ -468,6 +484,8 @@ class SkeletonCorrector(QMainWindow):
             self, "已保存",
             f"已写入: {os.path.basename(self.csv_path)}\n"
             f"原始备份: {os.path.basename(bak)}")
+        if was_playing:
+            self.play_btn.setChecked(True)
 
     # --------------------------------------------------------------- render
     def _show_frame(self) -> None:
@@ -724,8 +742,11 @@ class SkeletonCorrector(QMainWindow):
             return
         nf = self.cur_frame + 1
         if nf >= self.vtotal:
-            self.play_btn.setChecked(False)
-            return
+            if self.loop_cb.isChecked():
+                nf = 0
+            else:
+                self.play_btn.setChecked(False)
+                return
         self.cur_frame = nf
         self.slider.setValue(nf)
 

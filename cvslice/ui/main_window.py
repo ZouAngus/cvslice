@@ -1414,7 +1414,7 @@ class ClipAnnotator(QMainWindow):
         min_off = min(offs)
         max_off = max(offs)
         margin = 3
-        max_padding = 20
+        max_padding = 5
         pre = min(max(0, -min_off) + margin, max_padding)
         post = min(max(0, max_off) + margin, max_padding)
         return pre, post, min_off, max_off
@@ -2300,8 +2300,8 @@ class ClipAnnotator(QMainWindow):
                 self._nxt()
         elif k == Qt.Key_Q: self._jump(-1)
         elif k == Qt.Key_E: self._jump(1)
-        elif k == Qt.Key_W: self.scene_off_spin.setValue(self.scene_off_spin.value() + 1)
-        elif k == Qt.Key_S: self.scene_off_spin.setValue(self.scene_off_spin.value() - 1)
+        elif k == Qt.Key_W: self.view_off_spin.setValue(self.view_off_spin.value() + 1)
+        elif k == Qt.Key_S: self.view_off_spin.setValue(self.view_off_spin.value() - 1)
         elif k == Qt.Key_Up:
             r = max(0, self.act_list.currentRow() - 1)
             self.act_list.setCurrentRow(r)
