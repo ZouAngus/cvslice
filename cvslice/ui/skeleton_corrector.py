@@ -1,27 +1,19 @@
 """Skeleton Corrector — standalone window for fine-tuning 3D joints
 on short pre-clipped action segments.
 
-Inputs (one folder per action segment):
-  - one CSV with (T, J*3) 3D joint columns (e.g. ``0_x,0_y,0_z,1_x,...``)
-  - one or more ``*.mp4`` files whose names contain a CAMERA_NAME
+Inputs (one exported folder):
+  - one or more CSVs with (T, J*3) 3D joint columns
+  - per-action ``*.mp4`` files whose names contain a CAMERA_NAME
   - a ``calibration/`` subfolder with intrinsic/extrinsic JSON per camera
 
-Workflow:
-  1. File ▸ 打开文件夹  to load a segment.
-  2. Pick any two of seven cameras for left/right side-by-side views.
-  3. Drag a joint on either view; the 3D position updates with depth held
-     in that camera's frame; both views re-render.
-  4. Switch between "edit all joints" or "single joint" mode (click to
-     pick a joint first).
-  5. Mark joints get tracked in 已编辑关节 list — apply Gaussian temporal
-     smoothing to ONLY those joints with a configurable window.
-  6. File ▸ 保存  overwrites the CSV (a one-time ``.bak`` is kept).
-
-This window is independent of ClipAnnotator — no Excel, no offset JSON.
+Layout: top/bottom dual-view (landscape-friendly) + right edit panel.
+Action switching via combo box parsed from filenames.
+FPS-aware: video frames map to skeleton (CSV) frames via ratio.
 """
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 import cv2
@@ -45,7 +37,7 @@ from cvslice.vision.adjustment import (
 from cvslice.vision.projection import draw_skel_with_confidence, project_pts
 
 
-PICK_RADIUS_SOFT = 30  # pixel slack used by find_nearest_joint internally
+PICK_RADIUS_SOFT = 30
 
 
 class SkeletonCorrector(QMainWindow):
@@ -55,7 +47,7 @@ class SkeletonCorrector(QMainWindow):
     def __init__(self, folder: str | None = None):
         super().__init__()
         self.setWindowTitle("CVSlice — 骨骼矫正器 (Skeleton Corrector)")
-        self.resize(1500, 900)
+        self.resize(1400, 950)
 
         # Data state
         self.folder: str | None = None
@@ -64,25 +56,31 @@ class SkeletonCorrector(QMainWindow):
         self.pts3d_orig: np.ndarray | None = None
         self.pts3d_was_nan: np.ndarray | None = None
         self.calibs: dict = {}
-        self.videos: dict[str, str] = {}
+        self.videos: dict[str, str] = {}             # cam -> path (current action)
         self.caps: dict[str, cv2.VideoCapture] = {}
         self.vfps: float = 30.0
-        self.vtotal: int = 0
-        self.cur_frame: int = 0
+        self.vtotal: int = 0                          # video frame count (timeline)
+        self.cur_frame: int = 0                       # video frame index
+        self.pfps: float = 0.0                        # skeleton FPS (estimated)
+
+        # Action list parsed from folder
+        # Each entry: {"tag": str, "csv": path, "videos": {cam: path}}
+        self._actions: list[dict] = []
+        self._cur_action_idx: int = -1
 
         # Per-side projection cache for hit testing
         self._proj_L: np.ndarray | None = None
         self._proj_R: np.ndarray | None = None
 
         # Drag state
-        self._drag_side: str | None = None        # "L" or "R"
+        self._drag_side: str | None = None
         self._drag_cam: str | None = None
         self._drag_joint: int | None = None
         self._drag_z: float | None = None
         self._undo_pushed_for_drag: bool = False
 
         # Edit mode
-        self._selected_joint: int | None = None  # only meaningful in single mode
+        self._selected_joint: int | None = None
         self.edited_joints: set[int] = set()
 
         # Undo
@@ -94,7 +92,6 @@ class SkeletonCorrector(QMainWindow):
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
-        # --- Menus ---
         mb = self.menuBar()
         fm = mb.addMenu("文件")
         a_open = QAction("打开文件夹...", self)
@@ -125,39 +122,48 @@ class SkeletonCorrector(QMainWindow):
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
 
-        # Left column: views + playback
+        # Left column: action selector + views (top/bottom) + playback
         viewcol = QVBoxLayout()
 
+        # Action selector row
+        act_row = QHBoxLayout()
+        act_row.addWidget(QLabel("动作:"))
+        self.action_combo = QComboBox()
+        self.action_combo.currentIndexChanged.connect(self._on_action_changed)
+        act_row.addWidget(self.action_combo, 1)
+        viewcol.addLayout(act_row)
+
+        # Camera selector row
         cam_row = QHBoxLayout()
-        cam_row.addWidget(QLabel("左视图:"))
-        self.cam_left_combo = QComboBox()
-        self.cam_left_combo.currentTextChanged.connect(lambda _: self._show_frame())
-        cam_row.addWidget(self.cam_left_combo)
+        cam_row.addWidget(QLabel("上视图:"))
+        self.cam_top_combo = QComboBox()
+        self.cam_top_combo.currentTextChanged.connect(lambda _: self._show_frame())
+        cam_row.addWidget(self.cam_top_combo)
         cam_row.addSpacing(20)
-        cam_row.addWidget(QLabel("右视图:"))
-        self.cam_right_combo = QComboBox()
-        self.cam_right_combo.currentTextChanged.connect(lambda _: self._show_frame())
-        cam_row.addWidget(self.cam_right_combo)
+        cam_row.addWidget(QLabel("下视图:"))
+        self.cam_bot_combo = QComboBox()
+        self.cam_bot_combo.currentTextChanged.connect(lambda _: self._show_frame())
+        cam_row.addWidget(self.cam_bot_combo)
         cam_row.addStretch()
         viewcol.addLayout(cam_row)
 
-        vid_row = QHBoxLayout()
-        self.vid_left = VideoLabel()
-        self.vid_left.setMinimumSize(560, 420)
-        self.vid_left.setStyleSheet("background-color: black;")
-        self.vid_left.mouse_pressed.connect(lambda x, y: self._on_press("L", x, y))
-        self.vid_left.mouse_moved.connect(lambda x, y: self._on_move("L", x, y))
-        self.vid_left.mouse_released.connect(lambda x, y: self._on_release("L", x, y))
-        vid_row.addWidget(self.vid_left, 1)
+        # Top view
+        self.vid_top = VideoLabel()
+        self.vid_top.setMinimumSize(640, 260)
+        self.vid_top.setStyleSheet("background-color: black;")
+        self.vid_top.mouse_pressed.connect(lambda x, y: self._on_press("T", x, y))
+        self.vid_top.mouse_moved.connect(lambda x, y: self._on_move("T", x, y))
+        self.vid_top.mouse_released.connect(lambda x, y: self._on_release("T", x, y))
+        viewcol.addWidget(self.vid_top, 1)
 
-        self.vid_right = VideoLabel()
-        self.vid_right.setMinimumSize(560, 420)
-        self.vid_right.setStyleSheet("background-color: black;")
-        self.vid_right.mouse_pressed.connect(lambda x, y: self._on_press("R", x, y))
-        self.vid_right.mouse_moved.connect(lambda x, y: self._on_move("R", x, y))
-        self.vid_right.mouse_released.connect(lambda x, y: self._on_release("R", x, y))
-        vid_row.addWidget(self.vid_right, 1)
-        viewcol.addLayout(vid_row, 1)
+        # Bottom view
+        self.vid_bot = VideoLabel()
+        self.vid_bot.setMinimumSize(640, 260)
+        self.vid_bot.setStyleSheet("background-color: black;")
+        self.vid_bot.mouse_pressed.connect(lambda x, y: self._on_press("B", x, y))
+        self.vid_bot.mouse_moved.connect(lambda x, y: self._on_move("B", x, y))
+        self.vid_bot.mouse_released.connect(lambda x, y: self._on_release("B", x, y))
+        viewcol.addWidget(self.vid_bot, 1)
 
         # Playback row
         pb_row = QHBoxLayout()
@@ -176,7 +182,7 @@ class SkeletonCorrector(QMainWindow):
         self.slider.valueChanged.connect(self._on_slider)
         pb_row.addWidget(self.slider, 1)
         self.frame_lbl = QLabel("0 / 0")
-        self.frame_lbl.setMinimumWidth(80)
+        self.frame_lbl.setMinimumWidth(120)
         pb_row.addWidget(self.frame_lbl)
         viewcol.addLayout(pb_row)
 
@@ -185,14 +191,13 @@ class SkeletonCorrector(QMainWindow):
         # Right column: edit panel
         rp = QVBoxLayout()
 
-        # Mode group
         mode_g = QGroupBox("关节模式")
         mg = QVBoxLayout(mode_g)
         self.mode_all = QCheckBox("编辑所有关节 (All)")
         self.mode_all.setChecked(True)
         self.mode_all.stateChanged.connect(self._on_mode_changed)
         mg.addWidget(self.mode_all)
-        h = QLabel("取消勾选 → 单关节模式: 在画面中点击骨骼点选中后,只能拖动该关节。")
+        h = QLabel("取消勾选 → 单关节模式: 点击选中后只能拖动该关节。")
         h.setWordWrap(True)
         h.setStyleSheet("color:#888;")
         mg.addWidget(h)
@@ -200,7 +205,6 @@ class SkeletonCorrector(QMainWindow):
         mg.addWidget(self.sel_joint_lbl)
         rp.addWidget(mode_g)
 
-        # Edited joints group
         ej_g = QGroupBox("已编辑关节 (用于平滑)")
         ejl = QVBoxLayout(ej_g)
         self.edited_list = QListWidget()
@@ -211,7 +215,6 @@ class SkeletonCorrector(QMainWindow):
         ejl.addWidget(clr_btn)
         rp.addWidget(ej_g)
 
-        # Smoothing group
         sm_g = QGroupBox("时间平滑 (高斯)")
         sf = QFormLayout(sm_g)
         self.smooth_win = QSpinBox()
@@ -222,14 +225,12 @@ class SkeletonCorrector(QMainWindow):
         sm_btn = QPushButton("对已编辑关节做平滑")
         sm_btn.clicked.connect(self._apply_smoothing)
         sf.addRow(sm_btn)
-        h2 = QLabel("仅对'已编辑关节'列表中的关节,在时间轴上做高斯平滑。\n"
-                    "窗口越大越平滑(也会抹掉细节)。")
+        h2 = QLabel("仅对已编辑关节做时间轴高斯平滑。")
         h2.setWordWrap(True)
         h2.setStyleSheet("color:#888;")
         sf.addRow(h2)
         rp.addWidget(sm_g)
 
-        # Undo group
         un_g = QGroupBox("撤销")
         ug = QVBoxLayout(un_g)
         un_btn = QPushButton("撤销 (Ctrl+Z)")
@@ -251,46 +252,56 @@ class SkeletonCorrector(QMainWindow):
         right.setMaximumWidth(360)
         root.addWidget(right, 1)
 
-        # Playback timer
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._tick)
 
-        self.statusBar().showMessage("文件 ▸ 打开文件夹 加载一个动作片段目录。")
+        self.statusBar().showMessage("文件 ▸ 打开文件夹 加载导出目录。")
 
     # ----------------------------------------------------------------- IO
+
+    def _parse_actions(self, folder: str) -> list[dict]:
+        """Parse exported folder into a list of action entries.
+
+        Filename convention from CVSlice export:
+          CSV:   {id}-{scene}-{action}-{rep}.csv
+          Video: {id}-{scene}-{cam}-{action}-{rep}.mp4
+
+        We group by the CSV stem (without extension) as the action tag,
+        then find matching videos for each action.
+        """
+        csvs = sorted(f for f in os.listdir(folder) if f.lower().endswith(".csv"))
+        actions: list[dict] = []
+        for csv_fn in csvs:
+            tag = os.path.splitext(csv_fn)[0]  # e.g. "15-boss-walking_clockwise-rep1"
+            csv_path = os.path.join(folder, csv_fn)
+            # Find videos matching this action tag
+            # Video filenames have an extra camera name segment:
+            #   {id}-{scene}-{cam}-{action}-{rep}.mp4
+            # The CSV tag is {id}-{scene}-{action}-{rep}
+            # So we look for mp4 files that contain the action+rep part
+            vids: dict[str, str] = {}
+            for fn in sorted(os.listdir(folder)):
+                if not fn.lower().endswith(".mp4"):
+                    continue
+                low = fn.lower()
+                for cn in CAMERA_NAMES:
+                    if cn not in low:
+                        continue
+                    # Check if removing the camera segment from the video stem
+                    # gives us the CSV tag
+                    vid_stem = os.path.splitext(fn)[0]
+                    # Try removing "-{cam}-" and see if we get the csv tag
+                    candidate = vid_stem.replace(f"-{cn}-", "-", 1)
+                    if candidate == tag and cn not in vids:
+                        vids[cn] = os.path.join(folder, fn)
+                        break
+            actions.append({"tag": tag, "csv": csv_path, "videos": vids})
+        return actions
+
     def _open_folder(self, folder: str | None = None) -> None:
         if not folder:
-            folder = QFileDialog.getExistingDirectory(self, "选择动作片段目录")
+            folder = QFileDialog.getExistingDirectory(self, "选择导出目录")
         if not folder or not os.path.isdir(folder):
-            return
-
-        # Find CSV
-        csvs = [f for f in os.listdir(folder) if f.lower().endswith(".csv")]
-        if not csvs:
-            QMessageBox.warning(self, "错误", "目录内没有找到 .csv 文件")
-            return
-        if len(csvs) > 1:
-            self.statusBar().showMessage(
-                f"目录内多个 CSV,使用第一个: {csvs[0]}")
-        csv_path = os.path.join(folder, csvs[0])
-        pts3d, _valid, was_nan = load_csv_as_pts3d(csv_path)
-        if pts3d is None:
-            QMessageBox.warning(self, "错误", "CSV 列数不是 3 的倍数,无法解析")
-            return
-
-        # Find videos
-        videos: dict[str, str] = {}
-        for fn in sorted(os.listdir(folder)):
-            if not fn.lower().endswith(".mp4"):
-                continue
-            low = fn.lower()
-            for cn in CAMERA_NAMES:
-                if cn in low and cn not in videos:
-                    videos[cn] = os.path.join(folder, fn)
-                    break
-        if not videos:
-            QMessageBox.warning(self, "错误",
-                                "目录内没有找到 .mp4 视频(文件名需包含 7 个相机名之一)")
             return
 
         # Calibration
@@ -302,13 +313,59 @@ class SkeletonCorrector(QMainWindow):
                                 "无标定信息时无法投影骨骼或反投影拖拽。")
             return
 
-        # Open caps
+        actions = self._parse_actions(folder)
+        if not actions:
+            QMessageBox.warning(self, "错误", "目录内没有找到 .csv 文件")
+            return
+
+        # Release old caps
+        for c in self.caps.values():
+            c.release()
+        self.caps.clear()
+
+        self.folder = folder
+        self.calibs = calibs
+        self._actions = actions
+
+        # Populate action combo
+        self.action_combo.blockSignals(True)
+        self.action_combo.clear()
+        for a in actions:
+            self.action_combo.addItem(a["tag"])
+        self.action_combo.blockSignals(False)
+
+        # Load first action
+        self._load_action(0)
+
+        self.statusBar().showMessage(
+            f"已加载: {os.path.basename(folder)}  |  {len(actions)} 个动作")
+
+    def _on_action_changed(self, idx: int) -> None:
+        if idx < 0 or idx >= len(self._actions):
+            return
+        # Save before switching? For now just switch.
+        self._load_action(idx)
+
+    def _load_action(self, idx: int) -> None:
+        """Load a specific action by index."""
+        if idx < 0 or idx >= len(self._actions):
+            return
+        act = self._actions[idx]
+        self._cur_action_idx = idx
+
+        # Load CSV
+        pts3d, _valid, was_nan = load_csv_as_pts3d(act["csv"])
+        if pts3d is None:
+            QMessageBox.warning(self, "错误", f"CSV 解析失败: {act['csv']}")
+            return
+
+        # Release old caps, open new ones
         for c in self.caps.values():
             c.release()
         caps: dict[str, cv2.VideoCapture] = {}
         vfps = 30.0
-        min_total = 10 ** 9
-        for cn, path in videos.items():
+        min_vtotal = 10 ** 9
+        for cn, path in act["videos"].items():
             cap = cv2.VideoCapture(path)
             if not cap.isOpened():
                 continue
@@ -318,52 +375,77 @@ class SkeletonCorrector(QMainWindow):
                 vfps = f
             t = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             if t > 0:
-                min_total = min(min_total, t)
-
-        if min_total == 10 ** 9:
-            min_total = pts3d.shape[0]
+                min_vtotal = min(min_vtotal, t)
+        if min_vtotal == 10 ** 9:
+            min_vtotal = 0
 
         # Commit state
-        self.folder = folder
-        self.csv_path = csv_path
+        self.csv_path = act["csv"]
         self.pts3d = pts3d.astype(np.float64).copy()
         self.pts3d_orig = self.pts3d.copy()
         self.pts3d_was_nan = was_nan
-        self.calibs = calibs
-        self.videos = videos
+        self.videos = act["videos"]
         self.caps = caps
         self.vfps = vfps
-        self.vtotal = min(min_total, self.pts3d.shape[0])
+        self.vtotal = min_vtotal if min_vtotal > 0 else pts3d.shape[0]
+
+        # Estimate skeleton FPS from video duration
+        if self.vtotal > 0 and self.vfps > 0:
+            vid_duration = self.vtotal / self.vfps
+            self.pfps = pts3d.shape[0] / vid_duration
+        else:
+            self.pfps = self.vfps  # fallback: assume 1:1
+
         self.cur_frame = 0
         self.undo_stack.clear()
         self.edited_joints.clear()
         self._selected_joint = None
         self.sel_joint_lbl.setText("选中关节: -")
 
-        # Populate camera combos: only cameras with BOTH a video and calib
-        avail = [c for c in CAMERA_NAMES if c in caps and c in calibs]
-        self.cam_left_combo.blockSignals(True)
-        self.cam_right_combo.blockSignals(True)
-        self.cam_left_combo.clear()
-        self.cam_right_combo.clear()
+        # Populate camera combos
+        avail = [c for c in CAMERA_NAMES if c in caps and c in self.calibs]
+        self.cam_top_combo.blockSignals(True)
+        self.cam_bot_combo.blockSignals(True)
+        self.cam_top_combo.clear()
+        self.cam_bot_combo.clear()
         for c in avail:
-            self.cam_left_combo.addItem(c)
-            self.cam_right_combo.addItem(c)
-        if self.cam_left_combo.count() > 0:
-            self.cam_left_combo.setCurrentIndex(0)
-        if self.cam_right_combo.count() > 1:
-            self.cam_right_combo.setCurrentIndex(1)
-        self.cam_left_combo.blockSignals(False)
-        self.cam_right_combo.blockSignals(False)
+            self.cam_top_combo.addItem(c)
+            self.cam_bot_combo.addItem(c)
+        if self.cam_top_combo.count() > 0:
+            self.cam_top_combo.setCurrentIndex(0)
+        if self.cam_bot_combo.count() > 1:
+            self.cam_bot_combo.setCurrentIndex(1)
+        self.cam_top_combo.blockSignals(False)
+        self.cam_bot_combo.blockSignals(False)
 
         self.slider.setRange(0, max(0, self.vtotal - 1))
         self.slider.setValue(0)
         self._refresh_edited_list()
         self._update_undo_lbl()
         self._show_frame()
+
+        ratio_str = f"  ({self.pfps / self.vfps:.1f}x)" if abs(self.pfps - self.vfps) > 0.1 else ""
         self.statusBar().showMessage(
-            f"已加载: {os.path.basename(folder)}  |  {len(avail)} 相机  |  "
-            f"{self.pts3d.shape[0]} 帧 3D × {self.pts3d.shape[1]} 关节")
+            f"动作: {act['tag']}  |  {len(avail)} 相机  |  "
+            f"视频 {self.vtotal}帧@{self.vfps:.0f}fps  |  "
+            f"骨骼 {pts3d.shape[0]}帧@{self.pfps:.0f}fps{ratio_str}  |  "
+            f"{pts3d.shape[1]} 关节")
+
+    def _v2p(self, vframe: int) -> int:
+        """Map video frame index to pts3d (skeleton) frame index."""
+        if self.pts3d is None:
+            return 0
+        ptot = self.pts3d.shape[0]
+        if self.vfps <= 0 or self.pfps <= 0:
+            return max(0, min(ptot - 1, vframe))
+        idx = int(round(vframe * (self.pfps / self.vfps)))
+        return max(0, min(ptot - 1, idx))
+
+    def _p2v(self, pidx: int) -> int:
+        """Map pts3d (skeleton) frame index to video frame index."""
+        if self.pfps <= 0 or self.vfps <= 0:
+            return pidx
+        return int(round(pidx * (self.vfps / self.pfps)))
 
     def _save(self) -> None:
         if self.pts3d is None or not self.csv_path:
@@ -391,23 +473,26 @@ class SkeletonCorrector(QMainWindow):
     def _show_frame(self) -> None:
         if self.pts3d is None:
             return
-        self.frame_lbl.setText(f"{self.cur_frame} / {max(0, self.vtotal - 1)}")
-        self._render_side("L", self.vid_left, self.cam_left_combo.currentText())
-        self._render_side("R", self.vid_right, self.cam_right_combo.currentText())
+        pidx = self._v2p(self.cur_frame)
+        ratio_str = f"  skel:{pidx}" if abs(self.pfps - self.vfps) > 0.1 else ""
+        self.frame_lbl.setText(
+            f"{self.cur_frame} / {max(0, self.vtotal - 1)}{ratio_str}")
+        self._render_side("T", self.vid_top, self.cam_top_combo.currentText())
+        self._render_side("B", self.vid_bot, self.cam_bot_combo.currentText())
 
     def _render_side(self, side: str, lbl: VideoLabel, cam: str) -> None:
         frm = self._read_cam_frame(cam, self.cur_frame)
         if frm is None:
             return
+        pidx = self._v2p(self.cur_frame)
         if cam and cam in self.calibs and self.pts3d is not None:
             intr, extr = self.calibs[cam]
-            pts = self.pts3d[self.cur_frame]
+            pts = self.pts3d[pidx]
             proj = project_pts(pts, intr, extr, False, False, False)
             if proj is not None:
-                nan_mask = (self.pts3d_was_nan[self.cur_frame]
+                nan_mask = (self.pts3d_was_nan[pidx]
                             if self.pts3d_was_nan is not None else None)
                 draw_skel_with_confidence(frm, proj, nan_mask)
-                # Joint IDs
                 hf, wf = frm.shape[:2]
                 for ji in range(len(proj)):
                     jx, jy = int(proj[ji][0]), int(proj[ji][1])
@@ -423,17 +508,10 @@ class SkeletonCorrector(QMainWindow):
                         and self._drag_joint < len(proj)):
                     jx, jy = int(proj[self._drag_joint][0]), int(proj[self._drag_joint][1])
                     cv2.circle(frm, (jx, jy), 11, (0, 255, 0), 2)
-                if side == "L":
+                if side == "T":
                     self._proj_L = proj
                 else:
                     self._proj_R = proj
-        # Edited joints in red text marker
-        if self.edited_joints and self.pts3d is not None and cam in self.calibs:
-            for j in self.edited_joints:
-                if j >= self.pts3d.shape[1]:
-                    continue
-                # already drawn above via proj cache; nothing extra required.
-                pass
 
         hf, wf = frm.shape[:2]
         lbl.set_frame_size(wf, hf)
@@ -456,8 +534,8 @@ class SkeletonCorrector(QMainWindow):
 
     # -------------------------------------------------------------- mouse
     def _cam_for_side(self, side: str) -> str:
-        return (self.cam_left_combo.currentText() if side == "L"
-                else self.cam_right_combo.currentText())
+        return (self.cam_top_combo.currentText() if side == "T"
+                else self.cam_bot_combo.currentText())
 
     def _on_press(self, side: str, x: int, y: int) -> None:
         if self.pts3d is None:
@@ -465,29 +543,26 @@ class SkeletonCorrector(QMainWindow):
         cam = self._cam_for_side(side)
         if not cam or cam not in self.calibs:
             return
-        proj = self._proj_L if side == "L" else self._proj_R
+        proj = self._proj_L if side == "T" else self._proj_R
         if proj is None:
             return
         joint = find_nearest_joint(x, y, proj)
         if joint is None:
             return
 
-        # Single-joint mode: a click on a different joint just selects it.
         if not self.mode_all.isChecked():
             if self._selected_joint != joint:
                 self._selected_joint = joint
                 self.sel_joint_lbl.setText(f"选中关节: {joint}")
                 self._show_frame()
                 return
-            # else: same joint already selected → fall through and start drag
 
-        # Begin drag — preserve camera-space depth so the joint stays at the
-        # same distance from this camera while it slides in pixel space.
         Rt = extract_R_t(self.calibs[cam][1])
         if Rt is None:
             return
         R, t = Rt
-        z = get_camera_depth(self.pts3d[self.cur_frame, joint], R, t)
+        pidx = self._v2p(self.cur_frame)
+        z = get_camera_depth(self.pts3d[pidx, joint], R, t)
         if not np.isfinite(z) or z <= 1e-6:
             self.statusBar().showMessage(
                 f"无法开始拖动: 关节 {joint} 在 {cam} 视角下深度无效")
@@ -514,10 +589,10 @@ class SkeletonCorrector(QMainWindow):
         dist_raw = intr.get("dist_coeffs") or extr.get("dist_coeffs")
         dist = (np.array(dist_raw, dtype=np.float64).reshape(-1)
                 if dist_raw is not None else None)
+        pidx = self._v2p(self.cur_frame)
         new_p = unproject_2d_to_3d(x, y, self._drag_z, K, R, t, dist)
-        self.pts3d[self.cur_frame, self._drag_joint] = new_p
+        self.pts3d[pidx, self._drag_joint] = new_p
         self.edited_joints.add(self._drag_joint)
-        # Re-render BOTH sides so the partner view sees the change.
         self._show_frame()
 
     def _on_release(self, side: str, x: int, y: int) -> None:
@@ -558,10 +633,11 @@ class SkeletonCorrector(QMainWindow):
         self.undo_lbl.setText(f"撤销步数: {len(self.undo_stack)}")
 
     def _reset_all(self) -> None:
-        if self.pts3d_orig is None:
+        if self.pts3d is None or self.pts3d_orig is None:
             return
         ans = QMessageBox.question(
-            self, "恢复", "撤销所有修改并恢复到加载时状态?",
+            self, "确认",
+            "恢复所有 3D 点到加载时的状态?\n(可撤销)",
             QMessageBox.Yes | QMessageBox.No)
         if ans != QMessageBox.Yes:
             return
@@ -605,7 +681,6 @@ class SkeletonCorrector(QMainWindow):
         kernel = kernel / kernel.sum()
 
         self._push_undo()
-        T = self.pts3d.shape[0]
         pad = win // 2
         affected: list[int] = []
         for j in sorted(self.edited_joints):
@@ -614,7 +689,6 @@ class SkeletonCorrector(QMainWindow):
             for ax in range(3):
                 v = self.pts3d[:, j, ax]
                 if not np.all(np.isfinite(v)):
-                    # leave NaN-ish columns alone
                     continue
                 vp = np.pad(v, pad, mode="edge")
                 self.pts3d[:, j, ax] = np.convolve(vp, kernel, mode="valid")
