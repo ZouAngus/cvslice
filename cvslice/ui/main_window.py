@@ -110,6 +110,9 @@ class ClipAnnotator(QMainWindow):
         # Undo stack cap
         self._UNDO_MAX = 200
 
+        # Last export output directory (for quick Skeleton Corrector launch)
+        self._last_export_dir: str | None = None
+
         # Track edited frames: {pidx: set of joint indices}
         self._edited_frames: dict[int, set[int]] = {}
 
@@ -148,6 +151,10 @@ class ClipAnnotator(QMainWindow):
                      lambda: self._export(False, single_cam=True))
         em.addAction("Export ALL Clips (current cam only)...",
                      lambda: self._export(True, single_cam=True))
+
+        tm = mb.addMenu("Tools")
+        tm.addAction("Open Skeleton Corrector...",
+                     self._open_skeleton_corrector)
 
         root = QWidget(); self.setCentralWidget(root)
         hl = QHBoxLayout(root); hl.setContentsMargins(4, 4, 4, 4)
@@ -2677,7 +2684,7 @@ class ClipAnnotator(QMainWindow):
                     canonical_fi = base_sf + step
                     if self.pts3d is not None and ie:
                         intr, extr = ie
-                        pidx = v2p(canonical_fi, fps, self.pfps,
+                        pidx = v2p(canonical_fi, self.vfps, self.pfps,
                                    self.pts3d.shape[0], cam_skel_off)
                         pts = self.pts3d[pidx]
                         if self.pts3d_valid is not None and self.pts3d_valid[pidx]:
@@ -2689,7 +2696,7 @@ class ClipAnnotator(QMainWindow):
                                     nan_mask = self.pts3d_was_nan[pidx]
                                 draw_skel_with_confidence(chk, proj, nan_mask)
                     t = max(0, fi) / fps
-                    cv2.putText(chk, f"srcF:{fi} canonF:{canonical_fi} P:{v2p(canonical_fi, fps, self.pfps, self.pts3d.shape[0], cam_skel_off) if self.pts3d is not None else '?'}",
+                    cv2.putText(chk, f"srcF:{fi} canonF:{canonical_fi} P:{v2p(canonical_fi, self.vfps, self.pfps, self.pts3d.shape[0], cam_skel_off) if self.pts3d is not None else '?'}",
                                 (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
                                 (255, 255, 255), 2)
                     chk_writer.write(chk)
@@ -2703,6 +2710,24 @@ class ClipAnnotator(QMainWindow):
             self.timer.start(int(1000 / self.vfps))
         QMessageBox.information(self, "Done",
             f"Exported {len(indices)} actions to:\n{act_dir}")
+        self._last_export_dir = act_dir
+
+    def _open_skeleton_corrector(self):
+        """Launch the Skeleton Corrector window.
+
+        If an export was performed this session, default to that folder;
+        otherwise let the user pick one."""
+        from cvslice.ui.skeleton_corrector import SkeletonCorrector
+        folder = None
+        if self._last_export_dir and os.path.isdir(self._last_export_dir):
+            folder = self._last_export_dir
+        else:
+            folder = QFileDialog.getExistingDirectory(
+                self, "Select Exported Folder for Skeleton Corrector")
+            if not folder:
+                return
+        self._corrector_win = SkeletonCorrector(folder)
+        self._corrector_win.show()
 
     def _export_virtual_to(self, act_dir, stem, sf, ef, skel_off, vid_off=0):
         """Export a virtual (black background + skeleton) video clip."""
